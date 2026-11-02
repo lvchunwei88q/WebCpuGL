@@ -60,7 +60,7 @@ context.VSSetShader(vs);
 context.PSSetShader(ps);
 context.PSSetShaderResource(0, checker);   // samplers.t0
 
-context.RSSetState({ cullMode: 'BACK' });
+context.RSSetState({ cullMode: 'NONE' });
 context.OMSetDepthStencilState({ depthEnable: true, depthWriteEnable: true });
 context.OMSetBlendState({ enabled: true });
 
