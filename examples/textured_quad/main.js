@@ -69,7 +69,7 @@ function frame(tMs) {
   const mvp = math.multiply(math.rotationY(t * 0.6), math.rotationX(Math.sin(t * 0.7) * 0.3));
 
   context.VSSetConstantBuffer(0, { uMVP: mvp, uTime: t });
-  context.ClearRenderTarget([0.05, 0.05, 0.1, 1]);
+  context.ClearRenderTarget([0, 0, 0, 1]);
   context.ClearDepthStencil(1.0);
   context.DrawIndexed(12, 0, 0);
   context.present();

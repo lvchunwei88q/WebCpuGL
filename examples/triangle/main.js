@@ -35,7 +35,7 @@ function frame(tMs) {
   const pulse = 0.75 + 0.25 * Math.sin(t * 2.0);
 
   context.VSSetConstantBuffer(0, { uPulse: pulse, uTime: t });
-  context.ClearRenderTarget([0.04, 0.04, 0.08, 1]);
+  context.ClearRenderTarget([0, 0, 0, 1]);
   context.ClearDepthStencil(1.0);
   context.Draw(3, 0);
   context.present();
