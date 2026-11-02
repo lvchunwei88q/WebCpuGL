@@ -1,0 +1,283 @@
+// DX11-style immediate-mode device context. Holds all pipeline state and
+// runs the software rasterizer on the JS main thread.
+
+import { Framebuffer } from './Framebuffer.js';
+import { Buffer, Shader, Texture } from './resources.js';
+
+const FORMAT_SIZE = { FLOAT1: 4, FLOAT2: 8, FLOAT3: 12, FLOAT4: 16 };
+
+export class DeviceContext {
+  /**
+   * @param {HTMLCanvasElement} canvas — intrinsic width/height IS the framebuffer size (256x256).
+   */
+  constructor(canvas) {
+    this.canvas = canvas;
+    const width = canvas.width;
+    const height = canvas.height;
+    this.ctx2d = canvas.getContext('2d', { alpha: false });
+
+    this.fb = new Framebuffer(width, height);
+
+    // ---- IA stage ----
+    this.inputLayout = [];
+    this.vertexBuffers = []; // [{buffer, stride, offset}]
+    this.indexBuffer = null; // Buffer (Uint16Array / Uint32Array)
+    this.indexFormat = 'UINT16';
+
+    // ---- Shader stage ----
+    this.vs = null;
+    this.ps = null;
+
+    // ---- RS stage ----
+    this.rsState = { cullMode: 'BACK' }; // NONE | BACK | FRONT
+
+    // ---- OM stage ----
+    this.depthState = { depthEnable: true, depthWriteEnable: true, depthFunc: 'LESS_EQUAL' };
+    this.blendState = { enabled: false }; // srcAlpha / oneMinusSrcAlpha when on
+  }
+
+  // ============================================================
+  // IA: Input Assembler
+  // ============================================================
+
+  /**
+   * @param {Array<{semantic:string, offset:number, format:'FLOAT1'|'FLOAT2'|'FLOAT3'|'FLOAT4'}>} layout
+   */
+  IASetInputLayout(layout) { this.inputLayout = layout; }
+
+  /**
+   * @param {number} _slot  (reserved, only slot 0 used)
+   * @param {Array<{buffer:Buffer, stride:number, offset?:number}>} views
+   */
+  IASetVertexBuffers(_slot, views) { this.vertexBuffers = views; }
+
+  IASetIndexBuffer(buffer, format = 'UINT16') {
+    this.indexBuffer = buffer;
+    this.indexFormat = format;
+  }
+
+  // ============================================================
+  // Shader stage
+  // ============================================================
+  VSSetShader(shader) { this.vs = shader; }
+  PSSetShader(shader) { this.ps = shader; }
+
+  /**
+   * Bind a uniform object to the VS. In DX11 this is a real constant buffer,
+   * but here we just hand the whole object straight to vs().
+   */
+  VSSetConstantBuffer(_slot, uniformObject) {
+    if (this.vs) this.vs.cbuffer = uniformObject || {};
+  }
+  PSSetConstantBuffer(_slot, uniformObject) {
+    if (this.ps) this.ps.cbuffer = uniformObject || {};
+  }
+
+  /** @param {number} slot  @param {Texture|null} tex */
+  PSSetShaderResource(slot, tex) {
+    if (!this.ps) return;
+    this.ps.samplers = this.ps.samplers || {};
+    this.ps.samplers['t' + slot] = tex;
+  }
+
+  // ============================================================
+  // RS / OM state
+  // ============================================================
+  RSSetState({ cullMode = 'BACK' } = {}) { this.rsState.cullMode = cullMode; }
+
+  OMSetDepthStencilState({
+    depthEnable = true,
+    depthWriteEnable = true,
+    depthFunc = 'LESS_EQUAL',
+  } = {}) {
+    this.depthState = { depthEnable, depthWriteEnable, depthFunc };
+  }
+
+  OMSetBlendState({ enabled = false } = {}) {
+    this.blendState.enabled = enabled;
+  }
+
+  // ============================================================
+  // Clear
+  // ============================================================
+  ClearRenderTarget(color /* [r,g,b,a] 0..1 */) { this.fb.clearColor(color); }
+  ClearDepthStencil(d = 1.0) { this.fb.clearDepth(d); }
+
+  // ============================================================
+  // Draw
+  // ============================================================
+
+  /** Non-indexed draw. */
+  Draw(vertexCount, startVertexLocation = 0) {
+    const positions = new Array(vertexCount);
+    const varyings = new Array(vertexCount);
+    for (let i = 0; i < vertexCount; i++) {
+      const v = this._fetchVertex(startVertexLocation + i);
+      const out = this.vs.fn(v, this.vs.cbuffer || {});
+      positions[i] = out.position;
+      const rest = {};
+      for (const k in out) if (k !== 'position') rest[k] = out[k];
+      varyings[i] = rest;
+    }
+    for (let i = 0; i + 2 < vertexCount; i += 3) {
+      this._rasterTriangle(
+        [positions[i], positions[i+1], positions[i+2]],
+        [varyings[i],   varyings[i+1],   varyings[i+2]],
+      );
+    }
+  }
+
+  /** Indexed draw. */
+  DrawIndexed(indexCount, startIndexLocation = 0, baseVertexLocation = 0) {
+    if (!this.indexBuffer) throw new Error('DrawIndexed: no index buffer bound.');
+    const idx = this.indexBuffer.data; // Uint16Array | Uint32Array
+    const positions = new Array(indexCount);
+    const varyings = new Array(indexCount);
+    for (let i = 0; i < indexCount; i++) {
+      const vIdx = baseVertexLocation + idx[startIndexLocation + i];
+      const v = this._fetchVertex(vIdx);
+      const out = this.vs.fn(v, this.vs.cbuffer || {});
+      positions[i] = out.position;
+      const rest = {};
+      for (const k in out) if (k !== 'position') rest[k] = out[k];
+      varyings[i] = rest;
+    }
+    for (let i = 0; i + 2 < indexCount; i += 3) {
+      this._rasterTriangle(
+        [positions[i], positions[i+1], positions[i+2]],
+        [varyings[i],   varyings[i+1],   varyings[i+2]],
+      );
+    }
+  }
+
+  /** Push the internal framebuffer to the visible canvas. */
+  present() {
+    this.fb.imageData.data.set(this.fb.color);
+    this.ctx2d.putImageData(this.fb.imageData, 0, 0);
+  }
+
+  // ============================================================
+  // internals
+  // ============================================================
+
+  _fetchVertex(vertexIndex) {
+    const slot = this.vertexBuffers[0];
+    if (!slot) throw new Error('Draw: no vertex buffer bound.');
+    const buf = slot.buffer.data; // TypedArray
+    const base = vertexIndex * slot.stride + (slot.offset || 0) + buf.byteOffset;
+    const dv = new DataView(buf.buffer, base);
+    const out = {};
+    for (const attr of this.inputLayout) {
+      const o = attr.offset;
+      switch (attr.format) {
+        case 'FLOAT1': out[attr.semantic] = [dv.getFloat32(o, true)]; break;
+        case 'FLOAT2': out[attr.semantic] = [dv.getFloat32(o, true), dv.getFloat32(o+4, true)]; break;
+        case 'FLOAT3': out[attr.semantic] = [dv.getFloat32(o, true), dv.getFloat32(o+4, true), dv.getFloat32(o+8, true)]; break;
+        case 'FLOAT4': out[attr.semantic] = [dv.getFloat32(o, true), dv.getFloat32(o+4, true), dv.getFloat32(o+8, true), dv.getFloat32(o+12, true)]; break;
+      }
+    }
+    if (out.position && out.position.length === 3) out.position.push(1.0);
+    return out;
+  }
+
+  _rasterTriangle(pClip, vIn) {
+    const W = this.fb.width, H = this.fb.height;
+
+    // w-divide + viewport transform. p[i] = {sx, sy, sz, invW}
+    const p = new Array(3);
+    for (let i = 0; i < 3; i++) {
+      const [x, y, z, w] = pClip[i];
+      const inv = 1 / (w || 1e-8);
+      p[i] = {
+        sx: ( x * inv + 1) * 0.5 * W,
+        sy: (1 - y * inv) * 0.5 * H,
+        sz: z * inv,
+        invW: inv,
+      };
+    }
+
+    // 2D signed area (y-down). DX11 default: CW = front.
+    const area =
+      (p[1].sx - p[0].sx) * (p[2].sy - p[0].sy) -
+      (p[1].sy - p[0].sy) * (p[2].sx - p[0].sx);
+
+    if (this.rsState.cullMode !== 'NONE') {
+      // area > 0 => CW (front), area < 0 => CCW (back)
+      const isBack = area < 0;
+      if ((this.rsState.cullMode === 'BACK'  && isBack) ||
+          (this.rsState.cullMode === 'FRONT' && !isBack)) return;
+    }
+    if (Math.abs(area) < 1e-12) return;
+
+    const minX = Math.max(0, Math.floor(Math.min(p[0].sx, p[1].sx, p[2].sx)));
+    const maxX = Math.min(W - 1, Math.ceil(Math.max(p[0].sx, p[1].sx, p[2].sx)));
+    const minY = Math.max(0, Math.floor(Math.min(p[0].sy, p[1].sy, p[2].sy)));
+    const maxY = Math.min(H - 1, Math.ceil(Math.max(p[0].sy, p[1].sy, p[2].sy)));
+
+    const depth = this.fb.depth;
+    const color = this.fb.color;
+
+    for (let y = minY; y <= maxY; y++) {
+      const py = y + 0.5;
+      for (let x = minX; x <= maxX; x++) {
+        const px = x + 0.5;
+
+        // barycentric
+        const w0 = ((p[1].sx - px) * (p[2].sy - py) - (p[1].sy - py) * (p[2].sx - px)) / area;
+        const w1 = ((p[2].sx - px) * (p[0].sy - py) - (p[2].sy - py) * (p[0].sx - px)) / area;
+        const w2 = 1 - w0 - w1;
+        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+
+        const z = w0 * p[0].sz + w1 * p[1].sz + w2 * p[2].sz;
+
+        if (this.depthState.depthEnable) {
+          const di = y * W + x;
+          if (this.depthState.depthFunc === 'LESS_EQUAL' && z > depth[di]) continue;
+          if (this.depthState.depthFunc === 'LESS'       && z >= depth[di]) continue;
+          if (this.depthState.depthFunc === 'GREATER'    && z < depth[di]) continue;
+        }
+
+        // perspective-correct interpolation: 1/w at this pixel
+        const invW = w0 * p[0].invW + w1 * p[1].invW + w2 * p[2].invW;
+        const vary = {};
+        for (const k in vIn[0]) {
+          const a = vIn[0][k], b = vIn[1][k], c = vIn[2][k];
+          if (typeof a === 'number') {
+            vary[k] = (w0*a*p[0].invW + w1*b*p[1].invW + w2*c*p[2].invW) / invW;
+          } else {
+            const n = a.length;
+            const out = new Array(n);
+            for (let i = 0; i < n; i++) {
+              out[i] = (w0*a[i]*p[0].invW + w1*b[i]*p[1].invW + w2*c[i]*p[2].invW) / invW;
+            }
+            vary[k] = out;
+          }
+        }
+
+        const out = this.ps.fn(vary, this.ps.cbuffer || {}, this.ps.samplers || {});
+        if (!out || out.length < 3) continue;
+        let r = out[0], g = out[1], bch = out[2], a = out.length > 3 ? out[3] : 1;
+
+        const di = y * W + x;
+        if (this.depthState.depthWriteEnable && this.depthState.depthEnable) {
+          depth[di] = z;
+        }
+
+        const o = di * 4;
+        if (this.blendState.enabled) {
+          color[o]   = r * 255 * a + color[o]   * (1 - a);
+          color[o+1] = g * 255 * a + color[o+1] * (1 - a);
+          color[o+2] = bch*255 * a + color[o+2] * (1 - a);
+          color[o+3] = 255;
+        } else {
+          color[o]   = r * 255;
+          color[o+1] = g * 255;
+          color[o+2] = bch * 255;
+          color[o+3] = 255;
+        }
+      }
+    }
+  }
+}
+
+export { Buffer, Shader, Texture };

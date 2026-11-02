@@ -1,0 +1,25 @@
+// textured_quad/shader.sd
+
+import { transformVec4 } from '/webcpugl/math.js';
+
+export function vs(input, uniforms) {
+  const pos = transformVec4(uniforms.uMVP, input.POSITION);
+  // Pick which branch in the FS: z <= -0.2 means the textured back quad.
+  const useTex = input.POSITION[2] <= -0.2 ? 1.0 : 0.0;
+  return {
+    position: pos,
+    vUV: input.TEXCOORD,
+    vUseTex: useTex,
+  };
+}
+
+export function fs(input, uniforms, samplers) {
+  if (input.vUseTex > 0.5) {
+    // sample t0 (slot 0)
+    const c = samplers.t0.sample(input.vUV[0], input.vUV[1]);
+    return c;
+  } else {
+    // front translucent purple quad, alpha 0.55
+    return [0.65, 0.3, 1.0, 0.55];
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "webcpugl",
+  "version": "0.1.0",
+  "description": "A tiny DX11-style software rasterizer running on CPU in the browser, backed by a Node static server. Fixed 256x256 framebuffer.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

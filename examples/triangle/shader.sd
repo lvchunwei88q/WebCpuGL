@@ -1,0 +1,19 @@
+// triangle/shader.sd
+// Plain ES Module with a .sd extension.
+
+export function vs(input, uniforms) {
+  return {
+    position: [input.POSITION[0], input.POSITION[1], input.POSITION[2], 1.0],
+    vColor:   input.COLOR,
+  };
+}
+
+export function fs(input, uniforms, samplers) {
+  const p = uniforms.uPulse ?? 1.0;
+  return [
+    Math.min(1, input.vColor[0] * p),
+    Math.min(1, input.vColor[1] * p),
+    Math.min(1, input.vColor[2] * p),
+    input.vColor[3],
+  ];
+}
