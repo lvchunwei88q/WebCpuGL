@@ -34,7 +34,6 @@ setInterval(() => {
 }, 250);
 
 // ---- HUD: poll window.__gpu.lastFrame every 250ms ----
-const hud = document.getElementById('hud');
 setInterval(() => {
   const ctx = window.__gpu;
   if (!ctx || !ctx.lastFrame) return;
