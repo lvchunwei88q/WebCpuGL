@@ -5,9 +5,6 @@
 const params = new URLSearchParams(location.search);
 const example = params.get('example') || 'triangle';
 
-document.getElementById('title').textContent =
-  `WebCpuGL — 256×256 software rasterizer — example: ${example}`;
-
 const errBox = document.getElementById('err');
 window.addEventListener('error', (e) => {
   errBox.style.display = 'block';
