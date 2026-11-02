@@ -21,3 +21,27 @@ try {
   errBox.style.display = 'block';
   errBox.textContent = `Failed to load example "${example}":\n${e.stack || e}`;
 }
+
+// ---- debug HUD ----
+const hud = document.getElementById('hud');
+setInterval(() => {
+  const ctx = window.__gpu;
+  if (!ctx || !ctx.lastFrame) return;
+  const s = ctx.lastFrame;
+  hud.textContent =
+    `WebCpuGL  ${(s.fps || 0).toFixed(0)} fps  ${(s.frameMs || 0).toFixed(2)} ms\n` +
+    `draws=${s.drawCalls}  tris=${s.triangles}  culled=${s.culled}  px=${s.pixels}`;
+}, 250);
+
+// ---- HUD: poll window.__gpu.lastFrame every 250ms ----
+const hud = document.getElementById('hud');
+setInterval(() => {
+  const ctx = window.__gpu;
+  if (!ctx || !ctx.lastFrame) return;
+  const s = ctx.lastFrame;
+  hud.textContent =
+    `WebCpuGL  ${s.fps ? s.fps.toFixed(0)+' fps' : '--'}\n` +
+    `${(s.frameMs||0).toFixed(2)} ms/frame\n` +
+    `draws ${s.drawCalls}   tris ${s.triangles}   culled ${s.culled}\n` +
+    `shaded px ${s.pixels} / ${256*256}`;
+}, 250);

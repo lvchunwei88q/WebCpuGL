@@ -34,6 +34,15 @@ export class DeviceContext {
     // ---- OM stage ----
     this.depthState = { depthEnable: true, depthWriteEnable: true, depthFunc: 'LESS_EQUAL' };
     this.blendState = { enabled: false }; // srcAlpha / oneMinusSrcAlpha when on
+
+    // ---- per-frame stats (reset on present) ----
+    this.stats = {
+      drawCalls: 0,
+      triangles: 0,       // submitted to rasterizer (after cull)
+      culled: 0,         // rejected by backface cull
+      pixels: 0,         // fragments shaded & written
+    };
+    this._frameStart = 0;
   }
 
   // ============================================================
@@ -109,6 +118,7 @@ export class DeviceContext {
 
   /** Non-indexed draw. */
   Draw(vertexCount, startVertexLocation = 0) {
+    this.stats.drawCalls++;
     const positions = new Array(vertexCount);
     const varyings = new Array(vertexCount);
     for (let i = 0; i < vertexCount; i++) {
@@ -129,6 +139,7 @@ export class DeviceContext {
 
   /** Indexed draw. */
   DrawIndexed(indexCount, startIndexLocation = 0, baseVertexLocation = 0) {
+    this.stats.drawCalls++;
     if (!this.indexBuffer) throw new Error('DrawIndexed: no index buffer bound.');
     const idx = this.indexBuffer.data; // Uint16Array | Uint32Array
     const positions = new Array(indexCount);
@@ -152,8 +163,23 @@ export class DeviceContext {
 
   /** Push the internal framebuffer to the visible canvas. */
   present() {
+    const now = performance.now();
+    const dt = this._lastPresent ? (now - this._lastPresent) : 16.6;
+    this._lastPresent = now;
+    this.stats.frameMs = dt;
+    this.stats.fps = 1000 / dt;
+
     this.fb.imageData.data.set(this.fb.color);
     this.ctx2d.putImageData(this.fb.imageData, 0, 0);
+
+    // snapshot for HUD (read after present)
+    this.lastFrame = { ...this.stats };
+
+    // reset per-frame counters
+    this.stats.drawCalls = 0;
+    this.stats.triangles = 0;
+    this.stats.culled = 0;
+    this.stats.pixels = 0;
   }
 
   // ============================================================
@@ -205,9 +231,13 @@ export class DeviceContext {
       // area > 0 => CW (front), area < 0 => CCW (back)
       const isBack = area < 0;
       if ((this.rsState.cullMode === 'BACK'  && isBack) ||
-          (this.rsState.cullMode === 'FRONT' && !isBack)) return;
+          (this.rsState.cullMode === 'FRONT' && !isBack)) {
+        this.stats.culled++;
+        return;
+      }
     }
     if (Math.abs(area) < 1e-12) return;
+    this.stats.triangles++;
 
     const minX = Math.max(0, Math.floor(Math.min(p[0].sx, p[1].sx, p[2].sx)));
     const maxX = Math.min(W - 1, Math.ceil(Math.max(p[0].sx, p[1].sx, p[2].sx)));
@@ -262,6 +292,7 @@ export class DeviceContext {
         if (this.depthState.depthWriteEnable && this.depthState.depthEnable) {
           depth[di] = z;
         }
+        this.stats.pixels++;
 
         const o = di * 4;
         if (this.blendState.enabled) {

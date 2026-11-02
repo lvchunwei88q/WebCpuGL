@@ -5,6 +5,7 @@ import { createDevice, loadShader } from '/webcpugl/index.js';
 
 const canvas = document.getElementById('view');
 const { device, context } = createDevice(canvas);
+window.__gpu = context;   // for HUD / debugging
 
 // Vertex layout: POSITION (float3) + COLOR (float4), interleaved.
 // Stride = 3*4 + 4*4 = 28 bytes.

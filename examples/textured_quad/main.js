@@ -6,6 +6,7 @@ import { createDevice, loadShader, math } from '/webcpugl/index.js';
 
 const canvas = document.getElementById('view');
 const { device, context } = createDevice(canvas);
+window.__gpu = context;   // for HUD / debugging
 
 // ---- Build a 64x64 checkerboard texture procedurally (no external file) ----
 const TW = 64, TH = 64;

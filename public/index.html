@@ -35,6 +35,14 @@
       font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace;
       white-space: pre-wrap; display: none; z-index: 10;
     }
+    #hud {
+      position: fixed; top: 8px; left: 8px;
+      font: 11px/1.5 ui-monospace, Menlo, Consolas, monospace;
+      color: #9dffb0; background: rgba(0,0,0,.55);
+      padding: 4px 8px; border-radius: 3px;
+      pointer-events: none; z-index: 10;
+      white-space: pre;
+    }
   </style>
 </head>
 <body>
@@ -42,6 +50,7 @@
     <canvas id="view" width="256" height="256"></canvas>
   </div>
   <pre id="err"></pre>
+  <div id="hud"></div>
   <script type="module" src="/bootstrap.js"></script>
 </body>
 </html>
