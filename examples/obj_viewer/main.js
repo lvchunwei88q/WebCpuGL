@@ -1,9 +1,10 @@
 // Example: OBJ model viewer with procedural texture + orbit camera.
 // Run: node server.js  ->  http://localhost:8080/?example=obj_viewer
 
-import {
-  createDevice, loadShader, loadObj, loadTexture, Camera, math,
-} from '/webcpugl/index.js';
+import { createDevice, loadShader, math } from '/webcpugl/index.js';
+import { loadObj } from '/examples/_kit/ObjLoader.js';
+import { Camera } from '/examples/_kit/Camera.js';
+import { loadTexture } from '/examples/_kit/TextureLoader.js';
 
 const canvas = document.getElementById('view');
 const { device, context } = createDevice(canvas);

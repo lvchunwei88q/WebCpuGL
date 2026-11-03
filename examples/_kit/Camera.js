@@ -1,6 +1,6 @@
 // Simple perspective camera with mouse-orbit control.
 
-import * as math from './math.js';
+import * as math from '/webcpugl/math.js';
 
 export class Camera {
   constructor({
