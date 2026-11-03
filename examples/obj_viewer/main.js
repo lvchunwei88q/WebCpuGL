@@ -12,14 +12,16 @@ window.__gpu = context;
 
 // ---- Camera ----
 const camera = new Camera({
-  position: [0, 0.6, 3],
-  target:   [0, 0, 0],
-  fovY:     Math.PI / 3.5,
+  position: [0, 0.8, 3],
+  yaw: 0,
+  pitch: -0.1,
+  fovY: Math.PI / 3.5,
+  speed: 2.0,
 });
-camera.attachOrbit(canvas);
+camera.attachFly(canvas);
 
 // ---- OBJ ----
-const obj = await loadObj('/examples/obj_viewer/cube.obj');
+const obj = await loadObj('/examples/obj_viewer/model/obj/脸.obj');
 const vb = device.createBuffer({ usage: 'VERTEX', data: obj.vertexData });
 const ib = device.createBuffer({ usage: 'INDEX',  data: obj.indexData });
 
@@ -59,6 +61,7 @@ context.OMSetDepthStencilState({ depthEnable: true, depthWriteEnable: true });
 context.OMSetBlendState({ enabled: false });
 
 function frame() {
+  camera.update();
   context.VSSetConstantBuffer(0, {
     uViewProj: camera.viewProj(),
     uModel:    math.identity(),
