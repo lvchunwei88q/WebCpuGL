@@ -21,6 +21,7 @@ const PARTS = [
 ];
 
 const canvas = document.getElementById('view');
+// Framebuffer size: defaults to 256x256. Change here if you want bigger.
 const { device, context } = createDevice(canvas, 256, 256);
 window.__gpu = context;
 
@@ -32,6 +33,7 @@ const camera = new Camera({
   fovY: Math.PI / 3.5,
   speed: 2.0,
 });
+camera.aspect = context.fb.width / context.fb.height;
 camera.attachFly(canvas);
 
 // 1x1 white fallback texture
