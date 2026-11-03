@@ -33,6 +33,7 @@ export function fs(input, uniforms, samplers) {
   const isShadow = diff < 0 ? 1 : 0;
   const bias = smoothstep(0, 0.08, Math.abs(diff));
   let shadow = 1.0 - (1.0 - 0.55) * isShadow * (0.3 + 0.7 * bias);
+  shadow = Math.max(0.75, shadow);
 
   shadow = shadow * mask[1] + (1.0 - mask[1]);
   return [albedo[0]*shadow, albedo[1]*shadow, albedo[2]*shadow, 1.0];
