@@ -207,6 +207,61 @@ export class DeviceContext {
   }
 
   _rasterTriangle(pClip, vIn) {
+    // near-plane clip in clip space (w > NEAR)
+    const NEAR = 0.001;
+    const inside = [0, 1, 2].map(i => pClip[i][3] > NEAR);
+    if (inside[0] && inside[1] && inside[2]) {
+      this._rasterProjected(pClip, vIn);
+      return;
+    }
+    if (!inside[0] && !inside[1] && !inside[2]) return;
+
+    // Sutherland-Hodgman against w = NEAR
+    const poly = [];
+    const prev = { p: pClip[2], v: vIn[2], in: inside[2] };
+    for (let i = 0; i < 3; i++) {
+      const cur = { p: pClip[i], v: vIn[i], in: inside[i] };
+      if (cur.in) {
+        if (!prev.in) {
+          const t = (NEAR - prev.p[3]) / (cur.p[3] - prev.p[3]);
+          poly.push({ p: this._lerpVec4(prev.p, cur.p, t), v: this._lerpVary(prev.v, cur.v, t) });
+        }
+        poly.push({ p: cur.p, v: cur.v });
+      } else if (prev.in) {
+        const t = (NEAR - prev.p[3]) / (cur.p[3] - prev.p[3]);
+        poly.push({ p: this._lerpVec4(prev.p, cur.p, t), v: this._lerpVary(prev.v, cur.v, t) });
+      }
+      // swap
+      prev.p = cur.p; prev.v = cur.v; prev.in = cur.in;
+    }
+    for (let i = 1; i + 1 < poly.length; i++) {
+      this._rasterProjected(
+        [poly[0].p, poly[i].p, poly[i+1].p],
+        [poly[0].v, poly[i].v, poly[i+1].v],
+      );
+    }
+  }
+
+  _lerpVec4(a, b, t) {
+    return [
+      a[0] + (b[0] - a[0]) * t,
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+      a[3] + (b[3] - a[3]) * t,
+    ];
+  }
+
+  _lerpVary(a, b, t) {
+    const out = {};
+    for (const k in a) {
+      const av = a[k], bv = b[k];
+      if (typeof av === 'number') out[k] = av + (bv - av) * t;
+      else out[k] = av.map((x, i) => x + (bv[i] - x) * t);
+    }
+    return out;
+  }
+
+  _rasterProjected(pClip, vIn) {
     const W = this.fb.width, H = this.fb.height;
 
     // w-divide + viewport transform. p[i] = {sx, sy, sz, invW}
