@@ -69,12 +69,19 @@ context.RSSetState({ cullMode: 'NONE' });
 context.OMSetDepthStencilState({ depthEnable: true, depthWriteEnable: true });
 context.OMSetBlendState({ enabled: false });
 
+// ---- Light: orbits around the character ----
+let lightAngle = 0;          // radians
+const lightSpeed = 0.01;     // radians per frame
+const lightHeight = 0.6;     // y component
+
 function frame() {
   camera.update();
-  // slowly orbit the light around the character so you can see ILM shadow move
-  const t = performance.now() / 1000;
-  const a = t * 0.4;
-  const lightDir = [Math.sin(a), 0.6, Math.cos(a)];
+  lightAngle += lightSpeed;
+  const lightDir = [
+    Math.sin(lightAngle),
+    lightHeight,
+    Math.cos(lightAngle),
+  ];
 
   context.VSSetConstantBuffer(0, {
     uViewProj: camera.viewProj(),
