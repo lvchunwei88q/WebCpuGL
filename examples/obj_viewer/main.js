@@ -71,7 +71,7 @@ context.OMSetBlendState({ enabled: false });
 
 // ---- Light: orbits around the character ----
 let lightAngle = 0;          // radians
-const lightSpeed = 0.01;     // radians per frame
+const lightSpeed = 1;     // radians per frame
 const lightHeight = 0.6;     // y component
 
 function frame() {

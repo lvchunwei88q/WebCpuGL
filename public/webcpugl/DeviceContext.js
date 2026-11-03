@@ -75,13 +75,18 @@ export class DeviceContext {
 
   /**
    * Bind a uniform object to the VS. In DX11 this is a real constant buffer,
-   * but here we just hand the whole object straight to vs().
+   * but here we just hand the whole object straight to vs() and fs().
+   * Both VS and PS share the same uniform object.
    */
   VSSetConstantBuffer(_slot, uniformObject) {
-    if (this.vs) this.vs.cbuffer = uniformObject || {};
+    const u = uniformObject || {};
+    if (this.vs) this.vs.cbuffer = u;
+    if (this.ps) this.ps.cbuffer = u;
   }
   PSSetConstantBuffer(_slot, uniformObject) {
-    if (this.ps) this.ps.cbuffer = uniformObject || {};
+    const u = uniformObject || {};
+    if (this.ps) this.ps.cbuffer = u;
+    if (this.vs) this.vs.cbuffer = u;
   }
 
   /** @param {number} slot  @param {Texture|null} tex */
