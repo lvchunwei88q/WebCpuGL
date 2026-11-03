@@ -82,5 +82,4 @@ const port = Number(process.argv[2] || process.env.PORT || 8080);
 server.listen(port, () => {
   console.log(`WebCpuGL dev server running at http://localhost:${port}/`);
   console.log(`Try:  http://localhost:${port}/?example=triangle`);
-  console.log(`      http://localhost:${port}/?example=textured_quad`);
 });
