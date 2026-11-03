@@ -1,0 +1,36 @@
+// hair.sd — hair, simple toon + a soft rim highlight
+// t0 = albedo, t1 = shadow mask (G=1 receives shadow)
+
+import { transformVec4 } from '/webcpugl/math.js';
+
+export function vs(input, uniforms) {
+  const worldPos = transformVec4(uniforms.uModel, [
+    input.POSITION[0], input.POSITION[1], input.POSITION[2], 1.0
+  ]);
+  return {
+    position: transformVec4(uniforms.uViewProj, worldPos),
+    vNormal: input.NORMAL,
+    vWorld:  [worldPos[0], worldPos[1], worldPos[2]],
+    vUV:     [input.TEXCOORD[0], 1.0 - input.TEXCOORD[1]],
+  };
+}
+
+export function fs(input, uniforms, samplers) {
+  const u = input.vUV[0], v = input.vUV[1];
+  const albedo = samplers.t0.sample(u, v);
+  const mask   = samplers.t1.sample(u, v);
+
+  const L = uniforms.uLightDir || [0.4, 0.6, 0.6];
+  const n = input.vNormal;
+  const ndotl = Math.max(0, n[0]*L[0] + n[1]*L[1] + n[2]*L[2]);
+  const half = ndotl * 0.5 + 0.5;
+  let shadow = half < 0.55 ? 0.45 : 1.0;
+
+  // rim: brighten edges facing away from light
+  const view = uniforms.uViewDir || [0, 0, 1];
+  const rim = Math.max(0, 1 - Math.abs(n[0]*view[0] + n[1]*view[1] + n[2]*view[2]));
+  shadow += rim * 0.15;
+
+  shadow = shadow * mask[1] + (1.0 - mask[1]);
+  return [albedo[0]*shadow, albedo[1]*shadow, albedo[2]*shadow, 1.0];
+}

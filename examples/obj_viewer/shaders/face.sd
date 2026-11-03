@@ -1,0 +1,39 @@
+// face.sd — face / skin, uses ILM threshold map
+// t0 = albedo, t1 = shadow mask (G=1 receives shadow), t2 = ILM threshold (_r)
+
+import { transformVec4 } from '/webcpugl/math.js';
+
+export function vs(input, uniforms) {
+  const worldPos = transformVec4(uniforms.uModel, [
+    input.POSITION[0], input.POSITION[1], input.POSITION[2], 1.0
+  ]);
+  return {
+    position: transformVec4(uniforms.uViewProj, worldPos),
+    vNormal: input.NORMAL,
+    vUV:      [input.TEXCOORD[0], 1.0 - input.TEXCOORD[1]],
+  };
+}
+
+function smoothstep(a, b, x) {
+  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+export function fs(input, uniforms, samplers) {
+  const u = input.vUV[0], v = input.vUV[1];
+  const albedo = samplers.t0.sample(u, v);
+  const mask   = samplers.t1.sample(u, v);
+  const ilm    = samplers.t2.sample(u, v)[0];
+
+  const L = uniforms.uLightDir || [0.4, 0.6, 0.6];
+  const lz = L[2];
+  const len = Math.hypot(L[0], lz) || 1;
+  const ctrl = 0.5 + 0.5 * (lz / len);
+  const diff = ctrl - ilm;
+  const isShadow = diff > 0 ? 1 : 0;
+  const bias = smoothstep(0, 0.08, Math.abs(diff));
+  let shadow = 1.0 - (1.0 - 0.55) * isShadow * (0.3 + 0.7 * bias);
+
+  shadow = shadow * mask[1] + (1.0 - mask[1]);
+  return [albedo[0]*shadow, albedo[1]*shadow, albedo[2]*shadow, 1.0];
+}
