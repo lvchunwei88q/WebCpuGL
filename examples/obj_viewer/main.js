@@ -5,6 +5,7 @@ import { createDevice, loadShader, math } from '/webcpugl/index.js';
 import { loadObj } from '/examples/_kit/ObjLoader.js';
 import { Camera } from '/examples/_kit/Camera.js';
 import { loadTexture } from '/examples/_kit/TextureLoader.js';
+import { applyBloom } from '/examples/_kit/Bloom.js';
 
 const OBJ_DIR = '/examples/obj_viewer/model/obj/';
 const TEX_DIR = '/examples/obj_viewer/model/texture/';
@@ -106,6 +107,10 @@ function frame() {
     context.PSSetShaderResource(2, part.r);
     context.DrawIndexed(part.indexCount, 0, 0);
   }
+
+  applyBloom(context.fb.color, context.fb.width, context.fb.height, {
+    threshold: 0.75, intensity: 0.6, levels: 3, blurSize: 2,
+  });
 
   context.present();
   requestAnimationFrame(frame);
