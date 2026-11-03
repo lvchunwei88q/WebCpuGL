@@ -1,4 +1,4 @@
-// obj_viewer/shader.sd
+// obj_viewer/shader.sd  —  toon with shadow mask + face SDF ramp
 
 import { transformVec4 } from '/webcpugl/math.js';
 
@@ -10,14 +10,21 @@ export function vs(input, uniforms) {
   return {
     position: pos,
     vNormal:  input.NORMAL,
-    vUV:      [input.TEXCOORD[0], 1.0 - input.TEXCOORD[1]],  // flip V (OBJ origin bottom-left, image top-left)
+    vUV:      [input.TEXCOORD[0], 1.0 - input.TEXCOORD[1]],
   };
 }
 
 export function fs(input, uniforms, samplers) {
-  const albedo = samplers.t0.sample(input.vUV[0], input.vUV[1]);
+  const u = input.vUV[0], v = input.vUV[1];
 
-  // light direction (normalized)
+  // t0: albedo
+  const albedo = samplers.t0.sample(u, v);
+  // t1: shadow mask (G channel = 1 means this area may receive real-time shadow)
+  const mask = samplers.t1.sample(u, v);
+  // t2: baked face SDF ramp (grayscale, 1 = bright, 0 = shadow)
+  const ramp = samplers.t2.sample(u, v)[0];
+
+  // real-time directional light (half-lambert, 2 bands)
   const L = [0.4, 0.9, 0.5];
   const inv = 1 / Math.hypot(L[0], L[1], L[2]);
   const ndotl = Math.max(0,
@@ -25,15 +32,19 @@ export function fs(input, uniforms, samplers) {
     input.vNormal[1] * L[1] * inv +
     input.vNormal[2] * L[2] * inv
   );
-
-  // half-lambert then quantize into 2 toon bands
   const half = ndotl * 0.5 + 0.5;
-  const band = half < 0.55 ? 0.45 : 1.0;
+  const band = half < 0.55 ? 0.5 : 1.0;
 
-  return [
-    albedo[0] * band,
-    albedo[1] * band,
-    albedo[2] * band,
-    1.0,
-  ];
+  // shadow mask: only green (G~1) areas receive real-time shadow;
+  // black areas (G~0, e.g. eyes, brows, hard trim) stay fully lit.
+  const rtShadow = 1.0 - (1.0 - band) * mask[1];
+
+  // face SDF ramp: hard threshold at 0.5, tiny 1/64 smooth band for AA
+  const edge = 0.5;
+  const sdf = ramp < edge - 0.02 ? 0.55
+            : ramp > edge + 0.02 ? 1.0
+            : 0.55 + (ramp - (edge - 0.02)) / 0.04 * 0.45;
+
+  const k = rtShadow * sdf;
+  return [albedo[0] * k, albedo[1] * k, albedo[2] * k, 1.0];
 }
