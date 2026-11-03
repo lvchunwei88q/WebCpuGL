@@ -366,6 +366,7 @@ export class DeviceContext {
 
         const out = psFn(varyOut, psU, psS);
         if (!out || out.length < 3) continue;
+        const r = out[0], g = out[1], bch = out[2], a = out.length > 3 ? out[3] : 1;
 
         if (depthOn && depthWrite) depth[di] = z;
         this.stats.pixels++;
