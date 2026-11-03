@@ -12,11 +12,11 @@ const TEX_DIR  = '/examples/obj_viewer/model/texture/';
 // obj file -> texture file mapping
 const PARTS = [
   { obj: '脸.obj',    tex: 'T_NPC_036_face_d.png'   },
-  { obj: '皮肤.obj',  tex: 'T_NPC_036_face_d.png'   },
+  { obj: '皮肤.obj',  tex: 'T_NPC_036_02_d.png'   },
   { obj: '眼睛.obj',  tex: 'T_NPC_036_eyes_d.png'   },
   { obj: '头发.obj',  tex: 'T_NPC_036_hair_01_d.png' },
   { obj: '头发2.obj', tex: 'T_NPC_036_hair_02_d.png' },
-  { obj: '装饰.obj',  tex: 'T_NPC_036_01_d.png'     },
+  { obj: '装饰.obj',  tex: 'T_NPC_036_02_d.png'     },
   { obj: '裙子.obj',  tex: 'T_NPC_036_01_d.png'     },
 ];
 

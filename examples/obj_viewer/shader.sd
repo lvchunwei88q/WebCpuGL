@@ -10,7 +10,7 @@ export function vs(input, uniforms) {
   return {
     position: pos,
     vNormal:  input.NORMAL,
-    vUV:      input.TEXCOORD,
+    vUV:      [input.TEXCOORD[0], 1.0 - input.TEXCOORD[1]],  // flip V (OBJ origin bottom-left, image top-left)
   };
 }
 
