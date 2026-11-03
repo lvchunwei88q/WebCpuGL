@@ -70,21 +70,21 @@ export class DeviceContext {
   // ============================================================
   // Shader stage
   // ============================================================
-  VSSetShader(shader) { this.vs = shader; }
-  PSSetShader(shader) { this.ps = shader; }
+  VSSetShader(shader) { this.vs = shader; if (this._uniforms) shader.cbuffer = this._uniforms; }
+  PSSetShader(shader) { this.ps = shader; if (this._uniforms) shader.cbuffer = this._uniforms; }
 
   /**
-   * Bind a uniform object to the VS. In DX11 this is a real constant buffer,
-   * but here we just hand the whole object straight to vs() and fs().
-   * Both VS and PS share the same uniform object.
+   * Bind a uniform object to both VS and PS.
    */
   VSSetConstantBuffer(_slot, uniformObject) {
     const u = uniformObject || {};
+    this._uniforms = u;
     if (this.vs) this.vs.cbuffer = u;
     if (this.ps) this.ps.cbuffer = u;
   }
   PSSetConstantBuffer(_slot, uniformObject) {
     const u = uniformObject || {};
+    this._uniforms = u;
     if (this.ps) this.ps.cbuffer = u;
     if (this.vs) this.vs.cbuffer = u;
   }
