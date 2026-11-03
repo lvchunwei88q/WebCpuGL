@@ -53,9 +53,8 @@ export function fs(input, uniforms, samplers) {
     shadow = 1.0 - (1.0 - 0.55) * isShadow * (0.3 + 0.7 * bias);
   }
 
-  // ---- shadow mask: G channel = 1 means this pixel MUST receive shadow
-  //      (the dark trim/outline painted in _m). G = 0 = lit skin area. ----
-  shadow = 1.0 - (1.0 - shadow) * (1.0 - mask[1]);
+  // ---- shadow mask: G channel = 1 means this pixel receives the shadow L ----
+  shadow = shadow * mask[1] + (1.0 - mask[1]);
 
   return [albedo[0]*shadow, albedo[1]*shadow, albedo[2]*shadow, 1.0];
 }
