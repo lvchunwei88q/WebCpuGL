@@ -1,4 +1,9 @@
-// obj_viewer/shader.sd  —  toon with shadow mask + face SDF ramp
+// obj_viewer/shader.sd  —  ILM threshold toon shading
+//
+// t0 = albedo (_d)
+// t1 = shadow mask (_m), G channel = 1 means this pixel may receive shadow
+// t2 = ILM threshold map (_r, grayscale). White (1.0) = no ILM -> fallback
+//      to real-time ndotl band. Face uses the baked ILM threshold.
 
 import { transformVec4 } from '/webcpugl/math.js';
 
@@ -14,37 +19,42 @@ export function vs(input, uniforms) {
   };
 }
 
+function smoothstep(a, b, x) {
+  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
 export function fs(input, uniforms, samplers) {
   const u = input.vUV[0], v = input.vUV[1];
 
-  // t0: albedo
   const albedo = samplers.t0.sample(u, v);
-  // t1: shadow mask (G channel = 1 means this area may receive real-time shadow)
-  const mask = samplers.t1.sample(u, v);
-  // t2: baked face SDF ramp (grayscale, 1 = bright, 0 = shadow)
-  const ramp = samplers.t2.sample(u, v)[0];
+  const mask   = samplers.t1.sample(u, v);
+  const ilm    = samplers.t2.sample(u, v)[0];   // 0..1
 
-  // real-time directional light (half-lambert, 2 bands)
-  const L = [0.4, 0.9, 0.5];
-  const inv = 1 / Math.hypot(L[0], L[1], L[2]);
-  const ndotl = Math.max(0,
-    input.vNormal[0] * L[0] * inv +
-    input.vNormal[1] * L[1] * inv +
-    input.vNormal[2] * L[2] * inv
-  );
+  // light direction in world space (normalized, from uniforms)
+  const L = uniforms.uLightDir || [0.4, 0.6, 0.6];
+
+  // ---- body / clothes: real-time half-lambert 2 bands ----
+  const n = input.vNormal;
+  const ndotl = Math.max(0, n[0]*L[0] + n[1]*L[1] + n[2]*L[2]);
   const half = ndotl * 0.5 + 0.5;
-  const band = half < 0.55 ? 0.5 : 1.0;
+  let shadow = half < 0.55 ? 0.5 : 1.0;
 
-  // shadow mask: only green (G~1) areas receive real-time shadow;
-  // black areas (G~0, e.g. eyes, brows, hard trim) stay fully lit.
-  const rtShadow = 1.0 - (1.0 - band) * mask[1];
+  // ---- face: ILM threshold map ----
+  // Only when t2 is not the all-white fallback (face parts)
+  if (ilm < 0.999) {
+    // Front = +Z in model space. ctrl: 0 when light in front, 1 behind.
+    const lx = L[0], lz = L[2];
+    const len = Math.hypot(lx, lz) || 1;
+    const ctrl = 0.5 - 0.5 * (lz / len);
+    const diff = ctrl - ilm;
+    const isShadow = diff > 0 ? 1 : 0;
+    const bias = smoothstep(0, 0.08, Math.abs(diff));
+    shadow = 1.0 - (1.0 - 0.55) * isShadow * (0.3 + 0.7 * bias);
+  }
 
-  // face SDF ramp: hard threshold at 0.5, tiny 1/64 smooth band for AA
-  const edge = 0.5;
-  const sdf = ramp < edge - 0.02 ? 0.55
-            : ramp > edge + 0.02 ? 1.0
-            : 0.55 + (ramp - (edge - 0.02)) / 0.04 * 0.45;
+  // ---- shadow mask: black pixels (G~0, eyes/brows/trim) never receive shadow ----
+  shadow = 1.0 - (1.0 - shadow) * mask[1];
 
-  const k = rtShadow * sdf;
-  return [albedo[0] * k, albedo[1] * k, albedo[2] * k, 1.0];
+  return [albedo[0]*shadow, albedo[1]*shadow, albedo[2]*shadow, 1.0];
 }

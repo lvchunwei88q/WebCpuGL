@@ -21,7 +21,7 @@ const PARTS = [
 ];
 
 const canvas = document.getElementById('view');
-const { device, context } = createDevice(canvas);
+const { device, context } = createDevice(canvas,256,256);
 window.__gpu = context;
 
 // ---- Camera ----
@@ -71,9 +71,15 @@ context.OMSetBlendState({ enabled: false });
 
 function frame() {
   camera.update();
+  // slowly orbit the light around the character so you can see ILM shadow move
+  const t = performance.now() / 1000;
+  const a = t * 0.4;
+  const lightDir = [Math.sin(a), 0.6, Math.cos(a)];
+
   context.VSSetConstantBuffer(0, {
     uViewProj: camera.viewProj(),
     uModel:    math.identity(),
+    uLightDir: lightDir,
   });
   context.ClearRenderTarget([0, 0, 0, 1]);
   context.ClearDepthStencil(1.0);
