@@ -196,17 +196,17 @@ export class DeviceContext {
   _fetchVertex(vertexIndex) {
     const slot = this.vertexBuffers[0];
     if (!slot) throw new Error('Draw: no vertex buffer bound.');
-    const buf = slot.buffer.data; // TypedArray
-    const base = vertexIndex * slot.stride + (slot.offset || 0) + buf.byteOffset;
-    const dv = new DataView(buf.buffer, base);
+    const buf = slot.buffer.data;             // assumed Float32Array
+    const strideF = slot.stride / 4;          // bytes -> float index
+    const base = vertexIndex * strideF + (slot.offset || 0) / 4;
     const out = {};
     for (const attr of this.inputLayout) {
-      const o = attr.offset;
+      const fi = base + attr.offset / 4;
       switch (attr.format) {
-        case 'FLOAT1': out[attr.semantic] = [dv.getFloat32(o, true)]; break;
-        case 'FLOAT2': out[attr.semantic] = [dv.getFloat32(o, true), dv.getFloat32(o+4, true)]; break;
-        case 'FLOAT3': out[attr.semantic] = [dv.getFloat32(o, true), dv.getFloat32(o+4, true), dv.getFloat32(o+8, true)]; break;
-        case 'FLOAT4': out[attr.semantic] = [dv.getFloat32(o, true), dv.getFloat32(o+4, true), dv.getFloat32(o+8, true), dv.getFloat32(o+12, true)]; break;
+        case 'FLOAT1': out[attr.semantic] = [buf[fi]]; break;
+        case 'FLOAT2': out[attr.semantic] = [buf[fi], buf[fi+1]]; break;
+        case 'FLOAT3': out[attr.semantic] = [buf[fi], buf[fi+1], buf[fi+2]]; break;
+        case 'FLOAT4': out[attr.semantic] = [buf[fi], buf[fi+1], buf[fi+2], buf[fi+3]]; break;
       }
     }
     if (out.position && out.position.length === 3) out.position.push(1.0);
@@ -274,7 +274,7 @@ export class DeviceContext {
     // w-divide + viewport transform. p[i] = {sx, sy, sz, invW}
     const p = new Array(3);
     for (let i = 0; i < 3; i++) {
-      const [x, y, z, w] = pClip[i];
+      const x = pClip[i][0], y = pClip[i][1], z = pClip[i][2], w = pClip[i][3];
       const inv = 1 / (w || 1e-8);
       p[i] = {
         sx: ( x * inv + 1) * 0.5 * W,
@@ -290,7 +290,6 @@ export class DeviceContext {
       (p[1].sy - p[0].sy) * (p[2].sx - p[0].sx);
 
     if (this.rsState.cullMode !== 'NONE') {
-      // area > 0 => CW (front), area < 0 => CCW (back)
       const isBack = area < 0;
       if ((this.rsState.cullMode === 'BACK'  && isBack) ||
           (this.rsState.cullMode === 'FRONT' && !isBack)) {
@@ -306,54 +305,69 @@ export class DeviceContext {
     const minY = Math.max(0, Math.floor(Math.min(p[0].sy, p[1].sy, p[2].sy)));
     const maxY = Math.min(H - 1, Math.ceil(Math.max(p[0].sy, p[1].sy, p[2].sy)));
 
+    // ---- precompile varying layout once per triangle ----
+    const layout = [];
+    const varyOut = {};
+    const v0 = vIn[0], v1 = vIn[1], v2 = vIn[2];
+    for (const k in v0) {
+      const a = v0[k];
+      if (typeof a === 'number') {
+        layout.push({ key: k, vec: false });
+        varyOut[k] = 0;
+      } else {
+        layout.push({ key: k, vec: true, dim: a.length });
+        varyOut[k] = new Array(a.length);
+      }
+    }
+
+    // ---- hoist depth test branch out of pixel loop ----
+    const depthOn = this.depthState.depthEnable;
+    const depthWrite = this.depthState.depthWriteEnable;
+    const depthFunc = this.depthState.depthFunc;
     const depth = this.fb.depth;
     const color = this.fb.color;
+    const psFn = this.ps.fn;
+    const psU = this.ps.cbuffer || {};
+    const psS = this.ps.samplers || {};
 
     for (let y = minY; y <= maxY; y++) {
       const py = y + 0.5;
       for (let x = minX; x <= maxX; x++) {
         const px = x + 0.5;
 
-        // barycentric
         const w0 = ((p[1].sx - px) * (p[2].sy - py) - (p[1].sy - py) * (p[2].sx - px)) / area;
         const w1 = ((p[2].sx - px) * (p[0].sy - py) - (p[2].sy - py) * (p[0].sx - px)) / area;
         const w2 = 1 - w0 - w1;
         if (w0 < 0 || w1 < 0 || w2 < 0) continue;
 
+        const di = y * W + x;
         const z = w0 * p[0].sz + w1 * p[1].sz + w2 * p[2].sz;
 
-        if (this.depthState.depthEnable) {
-          const di = y * W + x;
-          if (this.depthState.depthFunc === 'LESS_EQUAL' && z > depth[di]) continue;
-          if (this.depthState.depthFunc === 'LESS'       && z >= depth[di]) continue;
-          if (this.depthState.depthFunc === 'GREATER'    && z < depth[di]) continue;
+        if (depthOn) {
+          if (depthFunc === 'LESS_EQUAL' && z > depth[di]) continue;
+          else if (depthFunc === 'LESS' && z >= depth[di]) continue;
+          else if (depthFunc === 'GREATER' && z < depth[di]) continue;
         }
 
-        // perspective-correct interpolation: 1/w at this pixel
         const invW = w0 * p[0].invW + w1 * p[1].invW + w2 * p[2].invW;
-        const vary = {};
-        for (const k in vIn[0]) {
-          const a = vIn[0][k], b = vIn[1][k], c = vIn[2][k];
-          if (typeof a === 'number') {
-            vary[k] = (w0*a*p[0].invW + w1*b*p[1].invW + w2*c*p[2].invW) / invW;
+        const inv = 1 / invW;
+        for (let li = 0; li < layout.length; li++) {
+          const L = layout[li];
+          const a = v0[L.key], b = v1[L.key], c = v2[L.key];
+          if (!L.vec) {
+            varyOut[L.key] = (w0*a*p[0].invW + w1*b*p[1].invW + w2*c*p[2].invW) * inv;
           } else {
-            const n = a.length;
-            const out = new Array(n);
-            for (let i = 0; i < n; i++) {
-              out[i] = (w0*a[i]*p[0].invW + w1*b[i]*p[1].invW + w2*c[i]*p[2].invW) / invW;
+            const out = varyOut[L.key];
+            for (let i = 0; i < L.dim; i++) {
+              out[i] = (w0*a[i]*p[0].invW + w1*b[i]*p[1].invW + w2*c[i]*p[2].invW) * inv;
             }
-            vary[k] = out;
           }
         }
 
-        const out = this.ps.fn(vary, this.ps.cbuffer || {}, this.ps.samplers || {});
+        const out = psFn(varyOut, psU, psS);
         if (!out || out.length < 3) continue;
-        let r = out[0], g = out[1], bch = out[2], a = out.length > 3 ? out[3] : 1;
 
-        const di = y * W + x;
-        if (this.depthState.depthWriteEnable && this.depthState.depthEnable) {
-          depth[di] = z;
-        }
+        if (depthOn && depthWrite) depth[di] = z;
         this.stats.pixels++;
 
         const o = di * 4;

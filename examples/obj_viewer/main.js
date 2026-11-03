@@ -81,11 +81,9 @@ const lightHeight = 0.6;
 function frame() {
   camera.update();
   lightAngle += lightSpeed;
-  const lightDir = [
-    Math.sin(lightAngle),
-    lightHeight,
-    Math.cos(lightAngle),
-  ];
+  const lx = Math.sin(lightAngle), lz = Math.cos(lightAngle);
+  const lLen = Math.hypot(lx, lz) || 1;
+  const lightDir = [lx / lLen, lightHeight, lz / lLen];
 
   context.VSSetConstantBuffer(0, {
     uViewProj: camera.viewProj(),
