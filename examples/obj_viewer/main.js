@@ -23,7 +23,7 @@ const PARTS = [
 
 const canvas = document.getElementById('view');
 // Framebuffer size: defaults to 1920x1080. Change here if you want bigger.
-const { device, context } = createDevice(canvas, 1920, 1080);
+const { device, context } = createDevice(canvas, 192, 108);
 window.__gpu = context;
 
 // ---- Camera ----
@@ -108,9 +108,9 @@ function frame() {
     context.DrawIndexed(part.indexCount, 0, 0);
   }
 
-  applyBloom(context.fb.color, context.fb.width, context.fb.height, {
-    threshold: 0.75, intensity: 0.6, levels: 3, blurSize: 2,
-  });
+  // applyBloom(context.fb.color, context.fb.width, context.fb.height, {
+  //   threshold: 0.75, intensity: 0.6, levels: 3, blurSize: 2,
+  // });
 
   context.present();
   requestAnimationFrame(frame);
