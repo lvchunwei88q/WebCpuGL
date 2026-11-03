@@ -23,7 +23,7 @@ PNG 的 alpha 几乎全为 254–255，当前 shader 也将最终 alpha 固定�
 | `眼睛.obj` | [`T_NPC_036_eyes_d.png`](model/texture/T_NPC_036_eyes_d.png) | 无 | 眼睛颜色图；当前示例没有为它绑定独立 mask 或法线图 |
 | `脸.obj` | [`T_NPC_036_face_d.png`](model/texture/T_NPC_036_face_d.png) | [`T_NPC_036_face_m.png`](model/texture/T_NPC_036_face_m.png)、[`T_NPC_036_face_r.png`](model/texture/T_NPC_036_face_r.png) | `face_r` 是脸部专用明暗数据，不是普通颜色图 |
 | `头发.obj` | [`T_NPC_036_hair_01_d.png`](model/texture/T_NPC_036_hair_01_d.png) | [`T_NPC_036_hair_01_m.png`](model/texture/T_NPC_036_hair_01_m.png) | 第一组头发颜色与遮罩 |
-| `头发2.obj` | [`T_NPC_036_hair_02_d.png`](model/texture/T_NPC_036_hair_02_d.png) | 有 [`T_NPC_036_hair_02_m.png`](model/texture/T_NPC_036_hair_02_m.png) | 注意：当前 `main.js` 给这个部件绑定的是 `hair_01_m`，而不是现成的 `hair_02_m`；若第二组头发阴影不对，应核对 UV 后改绑。 |
+| `头发2.obj` | [`T_NPC_036_hair_02_d.png`](model/texture/T_NPC_036_hair_02_d.png) | [`T_NPC_036_hair_02_m.png`](model/texture/T_NPC_036_hair_02_m.png) | 第二组头发应使用与其颜色图同组的 mask。 |
 
 ## 每种贴图的通道
 
@@ -68,24 +68,20 @@ shader 的计算是 `1 - (1 - band) * mask.g`。所以 G 通道不是“黑白�
 
 ### `face_r`：脸部明暗 ramp / SDF
 
-[`T_NPC_036_face_r.png`](model/texture/T_NPC_036_face_r.png) 是灰度数据图；文件中 R/G/B 三个通道相同。当前 shader 只采样 **R**：
+[`T_NPC_036_face_r.png`](model/texture/T_NPC_036_face_r.png) 是灰度数据图；文件中 R/G/B 三个通道相同。当前 shader 只采样 **R**，将其与由光照方向计算出的 `ctrl` 比较：`R > ctrl` 时进入阴影，`R < ctrl` 时保持明亮，交界处用窄平滑带抗锯齿。
 
-- R < 0.48：使用 0.55 的脸部阴影系数；
-- R > 0.52：使用 1.0 的亮部系数；
-- 0.48–0.52：在两者之间插值，减少边缘锯齿。
-
-因此 G、B 在当前实现中只是 R 的重复值；A 未使用。该数据配合脸部 UV/模型方向控制卡通脸部明暗，不应作为普通 RGB 颜色显示。
+因此 G、B 在当前实现中只是 R 的重复值；A 未使用。该数据配合脸部 UV/光照方向控制卡通脸部明暗，不应作为普通 RGB 颜色显示。
 
 ## 当前示例的实际限制
 
-- 当前绑定关系见 [`main.js`](main.js)，光照逻辑见 [`shader.sd`](shader.sd)。
+- 当前绑定关系见 [`main.js`](main.js)，头发阴影逻辑见 [`shaders/hair.sd`](shaders/hair.sd)，脸部逻辑见 [`shaders/face.sd`](shaders/face.sd)。
 - shader 只使用 `_d` 的 RGB、`_m` 的 G，以及脸部 `face_r` 的 R；所有 `_id` 图都没有绑定。
 - 示例用简化的顶点法线和两档 toon 光照，不是原游戏完整材质。最终画面与原游戏的差异不能单靠这些 PNG 消除。
-- `头发2.obj` 目前复用 `hair_01_m`，但目录中有单独的 `hair_02_m`。这可能是示例映射遗漏，也可能是有意复用；应结合两套 UV 和实际渲染验证后再改。
+- 两组头发分别绑定 `hair_01_m` 和 `hair_02_m`，避免第二组头发按第一组的 UV 采样错误遮罩。
 
 ## 资料与可信度
 
-没有从公开网页找到可核实的 `T_NPC_036` 原游戏资产说明或官方通道表，因此不能据此确认游戏名称、`_id` 的官方命名含义或 `_m` 未使用通道的用途。以上部件映射和遮罩/ramp 行为以本仓库的 OBJ、[`main.js`](main.js) 与 [`shader.sd`](shader.sd) 为准；法线图判断仅为贴图特征推断。
+没有从公开网页找到可核实的 `T_NPC_036` 原游戏资产说明或官方通道表，因此不能据此确认游戏名称、`_id` 的官方命名含义或 `_m` 未使用通道的用途。以上部件映射和遮罩/ramp 行为以本仓库的 OBJ、[`main.js`](main.js) 与 [`shaders/face.sd`](shaders/face.sd)、[`shaders/body.sd`](shaders/body.sd)、[`shaders/hair.sd`](shaders/hair.sd) 为准；法线图判断仅为贴图特征推断。
 
 以下资料只解释通用法线贴图概念，不代表这些角色文件来自相应引擎：
 

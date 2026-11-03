@@ -30,7 +30,7 @@ export function fs(input, uniforms, samplers) {
   const len = Math.hypot(L[0], lz) || 1;
   const ctrl = 0.5 + 0.5 * (lz / len);
   const diff = ctrl - ilm;
-  const isShadow = diff > 0 ? 1 : 0;
+  const isShadow = diff < 0 ? 1 : 0;
   const bias = smoothstep(0, 0.08, Math.abs(diff));
   let shadow = 1.0 - (1.0 - 0.55) * isShadow * (0.3 + 0.7 * bias);
 

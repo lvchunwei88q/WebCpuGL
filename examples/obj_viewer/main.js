@@ -15,7 +15,7 @@ const PARTS = [
   { obj: '皮肤.obj',  shader: 'face', d: 'T_NPC_036_02_d.png',      m: 'T_NPC_036_02_m.png',      r: null                     },
   { obj: '眼睛.obj',  shader: 'body', d: 'T_NPC_036_eyes_d.png',    m: null,                      r: null                     },
   { obj: '头发.obj',  shader: 'hair', d: 'T_NPC_036_hair_01_d.png', m: 'T_NPC_036_hair_01_m.png', r: null                     },
-  { obj: '头发2.obj', shader: 'hair', d: 'T_NPC_036_hair_02_d.png', m: 'T_NPC_036_hair_01_m.png', r: null                     },
+  { obj: '头发2.obj', shader: 'hair', d: 'T_NPC_036_hair_02_d.png', m: 'T_NPC_036_hair_02_m.png', r: null                     },
   { obj: '装饰.obj',  shader: 'body', d: 'T_NPC_036_02_d.png',      m: 'T_NPC_036_02_m.png',      r: null                     },
   { obj: '裙子.obj',  shader: 'body', d: 'T_NPC_036_01_d.png',      m: 'T_NPC_036_01_m.png',      r: null                     },
 ];
