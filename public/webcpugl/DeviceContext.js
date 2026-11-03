@@ -8,12 +8,14 @@ const FORMAT_SIZE = { FLOAT1: 4, FLOAT2: 8, FLOAT3: 12, FLOAT4: 16 };
 
 export class DeviceContext {
   /**
-   * @param {HTMLCanvasElement} canvas — intrinsic width/height IS the framebuffer size (256x256).
+   * @param {HTMLCanvasElement} canvas
+   * @param {number} [width=256]
+   * @param {number} [height=256]
    */
-  constructor(canvas) {
+  constructor(canvas, width = 256, height = 256) {
     this.canvas = canvas;
-    const width = canvas.width;
-    const height = canvas.height;
+    this.canvas.width = width;
+    this.canvas.height = height;
     this.ctx2d = canvas.getContext('2d', { alpha: false });
 
     this.fb = new Framebuffer(width, height);

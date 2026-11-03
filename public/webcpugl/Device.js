@@ -4,10 +4,8 @@ import { DeviceContext } from './DeviceContext.js';
 import { Buffer, Shader, Texture } from './resources.js';
 
 export class Device {
-  constructor(canvas) {
-    // Swapchain size is FIXED at canvas.width/height (set in index.html, 256x256).
-    // Callers must not override it.
-    this.context = new DeviceContext(canvas);
+  constructor(canvas, width = 256, height = 256) {
+    this.context = new DeviceContext(canvas, width, height);
   }
 
   /**
@@ -51,11 +49,12 @@ export class Device {
 }
 
 /**
- * One-stop: create a device bound to a canvas and return { device, context }.
- * The framebuffer size is fixed to the canvas's intrinsic width/height
- * (256x256, declared in index.html) — do not pass it in.
+ * One-stop: create a device bound to a canvas.
+ * @param {HTMLCanvasElement} canvas
+ * @param {number} [width=256]  framebuffer width (defaults to 256)
+ * @param {number} [height=256] framebuffer height (defaults to 256)
  */
-export function createDevice(canvas) {
-  const device = new Device(canvas);
+export function createDevice(canvas, width = 256, height = 256) {
+  const device = new Device(canvas, width, height);
   return { device, context: device.context };
 }
