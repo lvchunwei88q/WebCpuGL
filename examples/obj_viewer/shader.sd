@@ -15,15 +15,25 @@ export function vs(input, uniforms) {
 }
 
 export function fs(input, uniforms, samplers) {
-  const tex = samplers.t0.sample(input.vUV[0], input.vUV[1]);
-  // simple Lambert
-  const L = [0.5, 0.8, 0.6];
+  const albedo = samplers.t0.sample(input.vUV[0], input.vUV[1]);
+
+  // light direction (normalized)
+  const L = [0.4, 0.9, 0.5];
   const inv = 1 / Math.hypot(L[0], L[1], L[2]);
   const ndotl = Math.max(0,
     input.vNormal[0] * L[0] * inv +
     input.vNormal[1] * L[1] * inv +
     input.vNormal[2] * L[2] * inv
   );
-  const k = 0.25 + 0.75 * ndotl;
-  return [tex[0] * k, tex[1] * k, tex[2] * k, 1.0];
+
+  // half-lambert then quantize into 2 toon bands
+  const half = ndotl * 0.5 + 0.5;
+  const band = half < 0.55 ? 0.45 : 1.0;
+
+  return [
+    albedo[0] * band,
+    albedo[1] * band,
+    albedo[2] * band,
+    1.0,
+  ];
 }
