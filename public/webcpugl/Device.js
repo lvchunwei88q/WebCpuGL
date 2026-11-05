@@ -14,16 +14,30 @@ export class Device {
   createBuffer(desc) { return new Buffer(desc); }
 
   /** Wrap a vs() function from a loaded .sd module. */
-  createVertexShader(fn) { return new Shader('vs', fn); }
+  createVertexShader(fn, url) {
+    const s = new Shader('vs', fn);
+    if (url) s.url = url;
+    return s;
+  }
   /** Wrap a fs() function from a loaded .sd module. */
-  createPixelShader(fn) { return new Shader('ps', fn); }
+  createPixelShader(fn, url) {
+    const s = new Shader('ps', fn);
+    if (url) s.url = url;
+    return s;
+  }
 
   /**
    * Convenience: pass the whole module returned by ShaderLoader.loadShader().
+   * The shader source url is kept on both shaders, because raster workers import
+   * the same .sd module themselves instead of receiving the function.
    * Returns { vs, ps }.
    */
   createShaderPair(mod) {
-    return { vs: this.createVertexShader(mod.vs), ps: this.createPixelShader(mod.fs) };
+    const pair = {
+      vs: this.createVertexShader(mod.vs, mod.url),
+      ps: this.createPixelShader(mod.fs, mod.url),
+    };
+    return pair;
   }
 
   /**

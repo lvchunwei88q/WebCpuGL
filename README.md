@@ -95,6 +95,35 @@ context.DrawIndexed(indexCount, startIndex, baseVertex);
 context.present();                                 // blits FB to the visible canvas
 ```
 
+## Threads
+
+Rasterization can be spread over Web Workers, one horizontal band each. Both paths
+run through the same `RasterCore.js`, so the pixels are identical — only the thread
+count changes.
+
+```js
+await context.whenReady();          // optional: let the pool boot first
+context.setWorkerCount(8);          // clamped to 1..64, 1 = inline on the main thread
+context.setParallelPolicy('auto');  // 'auto' (default) | 'always'
+await context.present();            // worker mode: await before reading fb.color
+```
+
+`auto` is the useful default: a frame is only sent to the pool when it shades enough
+pixels per triangle to pay for splitting the work. Scenes with tiny triangles and low
+screen coverage (a 35k-triangle model covering ~7% of a 1080p frame, say) stay inline,
+which is measurably faster than handing them to workers. `always` forces the pool and
+is mainly useful for measuring.
+
+In the browser you can drive both without touching the code:
+
+```
+?example=obj_viewer&workers=8          # auto policy
+?example=obj_viewer&workers=8&policy=always
+```
+
+The HUD prints `threads <active>/<requested> (<mode>, cores <n>)`, so you can see which
+path a frame actually took.
+
 ## Writing a `.sd` shader
 
 A `.sd` file is **plain ES Module JavaScript** with a `.sd` extension. It must

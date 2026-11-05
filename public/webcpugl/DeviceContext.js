@@ -1,17 +1,49 @@
-// DX11-style immediate-mode device context. Holds all pipeline state and
-// runs the software rasterizer on the JS main thread.
+// DX11-style immediate-mode device context.
 //
-// Varyings are carried as flat Float64Array slices (one row per vertex, `stride`
-// doubles wide) instead of per-vertex objects. Per-pixel interpolation therefore
-// reads through numeric offsets and writes into preallocated slot arrays, with no
-// string-keyed lookups and no per-pixel allocation. Fragment shaders still receive
-// an object (`input.vUV`, `input.vNormal`, ...), so .sd files are unchanged.
+// Rasterization runs either inline on the main thread or spread over a pool of Web
+// Workers, one horizontal band per worker. Both paths go through RasterCore, so the
+// pixels are identical; only the thread count changes.
+//
+// Varyings are carried as flat Float64Array rows (one row per vertex, `stride`
+// doubles wide) instead of per-vertex objects, so per-pixel interpolation uses
+// numeric offsets and never touches a string-keyed lookup.
+//
+// Worker mode notes:
+//   - Shaders must come from loadShader() / createShaderPair(), because a worker
+//     cannot receive a function; it imports the same .sd module by URL.
+//   - Textures are sent as {width, height, data} and rebuilt in the worker
+//     (structured clone would drop the sample() method).
+//   - present() returns a Promise. Await it when you need fb.color/fb.depth, or to
+//     keep the frame rate tied to the raster throughput.
 
 import { Framebuffer } from './Framebuffer.js';
 import { Buffer, Shader, Texture } from './resources.js';
+import * as core from './RasterCore.js';
 
-const FORMAT_SIZE = { FLOAT1: 4, FLOAT2: 8, FLOAT3: 12, FLOAT4: 16 };
-const NEAR_W = 0.001;
+const MIN_WORKERS = 1;
+const MAX_WORKERS = 64;
+
+/** Shaded pixels per triangle above which a frame is worth sending to workers. */
+const AUTO_MIN_PX_PER_TRI = 12;
+
+function hardwareCores() {
+  if (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) {
+    return navigator.hardwareConcurrency | 0;
+  }
+  return 4;
+}
+
+/** Default thread count: enough to matter, few enough to not thrash. */
+function defaultWorkers() {
+  return Math.max(1, Math.min(8, hardwareCores()));
+}
+
+/** Clamp any requested thread count into [1, 64]. */
+function clampWorkers(n) {
+  const v = Math.floor(Number(n));
+  if (!Number.isFinite(v) || v < MIN_WORKERS) return MIN_WORKERS;
+  return Math.min(MAX_WORKERS, v);
+}
 
 export class DeviceContext {
   /**
@@ -38,20 +70,115 @@ export class DeviceContext {
     this.ps = null;
 
     // ---- RS stage ----
-    this.rsState = { cullMode: 'BACK' }; // NONE | BACK | FRONT
+    this.rsState = { cullMode: 'BACK' };
 
     // ---- OM stage ----
     this.depthState = { depthEnable: true, depthWriteEnable: true, depthFunc: 'LESS_EQUAL' };
-    this.blendState = { enabled: false }; // srcAlpha / oneMinusSrcAlpha when on
+    this.blendState = { enabled: false };
 
     // ---- per-frame stats (reset on present) ----
     this.stats = {
       drawCalls: 0,
-      triangles: 0,       // submitted to rasterizer (after cull)
-      culled: 0,         // rejected by backface cull
-      pixels: 0,         // fragments shaded & written
+      triangles: 0,
+      culled: 0,
+      pixels: 0,
+      workers: { requested: 1, active: 1, cores: hardwareCores() },
     };
-    this._frameStart = 0;
+
+    // ---- worker pool ----
+    this._workerCount = 1;
+    this._workers = [];
+    this._bands = [];          // {index, y0, y1, owner}
+    this._bandRows = height;
+    this._poolReady = false;
+    this._parallel = false;
+    this._disabled = false;
+    this._warned = false;
+    this._commands = [];       // queued frame commands while running in worker mode
+    this._pending = new Map(); // frameId -> {remaining, bands, pixels, resolve}
+    this._frameSeq = 0;
+    this._texIds = new WeakMap();
+    this._texById = new Map();
+    this._texSent = new Set();
+    this._nextTexId = 1;
+    this._spans = null;
+    this._counts = null;
+    this._policy = 'auto';     // 'auto' | 'always'
+    this._lastPxPerTri = 0;    // previous frame, drives the auto policy
+    this._frameUseParallel = null;  // this frame's decision, taken at first draw
+    this._framePath = 'inline';
+    this._slabsStale = false;  // inline writes since the last slab sync
+
+    if (typeof Worker !== 'undefined') this.setWorkerCount(undefined);
+  }
+
+  // ============================================================
+  // Thread control
+  // ============================================================
+
+  /** Threads requested by the caller (already clamped). */
+  get workerCount() { return this._workerCount; }
+
+  /** Threads actually rasterizing right now (1 means the inline path). */
+  get activeWorkers() { return this._framePath === 'parallel' ? this._workers.length : 1; }
+
+  /**
+   * How the frame decides between the inline and worker path.
+   * 'auto' (default) keeps low-coverage frames inline, where the worker path's
+   * per-triangle packing and buffer cloning would cost more than it saves.
+   * 'always' sends every frame to the pool.
+   * @param {'auto'|'always'} p
+   */
+  setParallelPolicy(p) {
+    this._policy = p === 'always' ? 'always' : 'auto';
+    this._lastPxPerTri = 0;   // let the next frame re-measure before dispatching
+    this._frameUseParallel = null;
+    return this._policy;
+  }
+
+  /** @returns {'auto'|'always'} */
+  get parallelPolicy() { return this._policy; }
+
+  /**
+   * Resolves once the raster pool has reported ready. Await this before drawing
+   * if you want the very first frame to run in parallel; otherwise the first
+   * frames fall back to the inline path while workers boot.
+   * Resolves immediately when running inline.
+   * @returns {Promise<void>}
+   */
+  whenReady() {
+    if (this._workerCount <= 1 || this._disabled || this._poolReady) return Promise.resolve();
+    if (this._readyPromise) return this._readyPromise;
+    this._readyPromise = new Promise((resolve) => { this._readyResolve = resolve; });
+    return this._readyPromise;
+  }
+
+  /**
+   * Set the raster thread count. Always clamped to [1, 64].
+   * 1 = run inline on the main thread (synchronous, no workers).
+   * undefined / null = default = min(8, navigator.hardwareConcurrency).
+   * @param {number} [n]
+   * @returns {number} the clamped value that was applied
+   */
+  setWorkerCount(n) {
+    const want = (n === undefined || n === null) ? clampWorkers(defaultWorkers()) : clampWorkers(n);
+
+    if (want === this._workerCount && (this._poolReady || this._workers.length > 0)) {
+      return this._workerCount;
+    }
+
+    this._shutdownWorkers();
+    this._workerCount = want;
+    this._disabled = false;
+    this._warned = false;
+    this._commands.length = 0;
+    this._frameUseParallel = null;
+
+    if (want > 1 && typeof Worker !== 'undefined') this._spawnWorkers(want);
+    else this._disabled = want > 1; // no Worker support in this environment
+
+    this.stats.workers = { requested: this._workerCount, active: this.activeWorkers, cores: hardwareCores() };
+    return this._workerCount;
   }
 
   // ============================================================
@@ -80,9 +207,6 @@ export class DeviceContext {
   VSSetShader(shader) { this.vs = shader; if (this._uniforms) shader.cbuffer = this._uniforms; }
   PSSetShader(shader) { this.ps = shader; if (this._uniforms) shader.cbuffer = this._uniforms; }
 
-  /**
-   * Bind a uniform object to both VS and PS.
-   */
   VSSetConstantBuffer(_slot, uniformObject) {
     const u = uniformObject || {};
     this._uniforms = u;
@@ -101,6 +225,7 @@ export class DeviceContext {
     if (!this.ps) return;
     this.ps.samplers = this.ps.samplers || {};
     this.ps.samplers['t' + slot] = tex;
+    if (tex) this._textureId(tex);
   }
 
   // ============================================================
@@ -116,15 +241,22 @@ export class DeviceContext {
     this.depthState = { depthEnable, depthWriteEnable, depthFunc };
   }
 
-  OMSetBlendState({ enabled = false } = {}) {
-    this.blendState.enabled = enabled;
-  }
+  OMSetBlendState({ enabled = false } = {}) { this.blendState.enabled = enabled; }
 
   // ============================================================
   // Clear
   // ============================================================
-  ClearRenderTarget(color /* [r,g,b,a] 0..1 */) { this.fb.clearColor(color); }
-  ClearDepthStencil(d = 1.0) { this.fb.clearDepth(d); }
+  ClearRenderTarget(color /* [r,g,b,a] 0..1 */) {
+    const cmd = { type: 'clearColor', rgba: [color[0], color[1], color[2], color[3] === undefined ? 1 : color[3]] };
+    if (this._willQueue()) { this._commands.push(cmd); return; }
+    core.clearColorBuffer(this.fb.color, cmd.rgba, this.fb.width, this.fb.height, 0);
+  }
+
+  ClearDepthStencil(d = 1.0) {
+    const cmd = { type: 'clearDepth', depth: d };
+    if (this._willQueue()) { this._commands.push(cmd); return; }
+    this.fb.depth.fill(d);
+  }
 
   // ============================================================
   // Draw
@@ -143,25 +275,63 @@ export class DeviceContext {
     this._runDraw(indexCount, this.indexBuffer.data, startIndexLocation, baseVertexLocation);
   }
 
-  /** Push the internal framebuffer to the visible canvas. */
+  /**
+   * Push the internal framebuffer to the visible canvas.
+   * Resolves with `lastFrame`. In worker mode the pixels only land in fb.color /
+   * fb.depth once this resolves; in inline mode it resolves immediately.
+   * @returns {Promise<object>}
+   */
   present() {
-    const now = performance.now();
-    const dt = this._lastPresent ? (now - this._lastPresent) : 16.6;
-    this._lastPresent = now;
-    this.stats.frameMs = dt;
-    this.stats.fps = 1000 / dt;
+    // switch to the worker path only at a frame boundary, so a frame is never
+    // half inline and half queued
+    if (this._poolReady && !this._parallel && !this._disabled) this._activateParallel();
 
-    this.fb.imageData.data.set(this.fb.color);
-    this.ctx2d.putImageData(this.fb.imageData, 0, 0);
+    if (this._willQueue()) {
+      if (this._slabsStale) this._syncSlabs();   // previous frames were inline
+      return this._presentParallel();
+    }
 
-    // snapshot for HUD (read after present)
-    this.lastFrame = { ...this.stats };
+    // inline frame: anything queued (e.g. a clear that landed before the
+    // decision was made) is replayed first, then the frame is blitted
+    if (this._commands.length > 0) {
+      const queued = this._commands;
+      this._commands = [];
+      this._replayInline(queued);
+    }
+    this._presentInline();
+    return Promise.resolve(this.lastFrame);
+  }
 
-    // reset per-frame counters
-    this.stats.drawCalls = 0;
-    this.stats.triangles = 0;
-    this.stats.culled = 0;
-    this.stats.pixels = 0;
+  /**
+   * Per-frame routing decision, taken once at the first clear/draw of the frame
+   * and reused by present(). Deciding this early matters: a low-coverage frame
+   * then never builds a queued command at all, it rasterizes straight inline.
+   */
+  _willQueue() {
+    if (!this._parallel) return false;
+    if (this._frameUseParallel === null) {
+      this._frameUseParallel = this._policy === 'always' ? true : this._shouldDispatch();
+    }
+    return this._frameUseParallel;
+  }
+
+  /**
+   * Auto policy: dispatch to workers only when the frame shades enough pixels per
+   * triangle to pay for the packing.
+   *
+   * A triangle costs the worker path once in band packing and once again in the
+   * clone back, no matter how few pixels it covers; the parallel saving is per
+   * shaded pixel. Measured on this project, packing is ~250 ns/tri and the pixel
+   * saving at 8 workers is ~0.12 us/px, so the break-even sits near 10 px/tri.
+   * Frames that shade fewer pixels than that stay inline.
+   *
+   * Uses the previous frame as the predictor; the first frame stays inline
+   * because there is nothing to predict from yet.
+   */
+  _shouldDispatch() {
+    const ratio = this._lastPxPerTri;
+    if (!(ratio >= AUTO_MIN_PX_PER_TRI)) return false;
+    return true;
   }
 
   // ============================================================
@@ -189,67 +359,9 @@ export class DeviceContext {
   }
 
   /**
-   * Describe the varying shape of a vs() output once per draw call.
-   * Every vector output is stored at a fixed offset inside the flat row,
-   * so interpolation never has to look a key up again.
+   * Vertex stage (always on the main thread) followed by either immediate inline
+   * rasterization or a queued draw command for the worker pool.
    */
-  _buildVaryingPlan(vsOut) {
-    const vecKeys = [], vecDim = [], vecOff = [];
-    const sclKeys = [], sclOff = [];
-    const vecTargets = [];
-    const varyOut = {};              // what fs() receives, reused per triangle
-    let off = 0;
-    for (const k in vsOut) {
-      if (k === 'position') continue;
-      const a = vsOut[k];
-      if (typeof a === 'number') {
-        sclKeys.push(k); sclOff.push(off); off += 1;
-        varyOut[k] = 0;
-      } else {
-        vecKeys.push(k); vecDim.push(a.length); vecOff.push(off); off += a.length;
-        // packed (not holey) so writes stay fast inside the pixel loop
-        const target = new Array(a.length).fill(0);
-        vecTargets.push(target);
-        varyOut[k] = target;
-      }
-    }
-    return {
-      stride: off > 0 ? off : 1,
-      vecCount: vecKeys.length,
-      vecKeys, vecDim, vecOff, vecTargets,
-      sclCount: sclKeys.length,
-      sclKeys, sclOff,
-      varyOut,
-    };
-  }
-
-  /** Copy one vs() output into its position slot and varying row. */
-  _writeVertex(pos, vf, i, out, plan) {
-    const p = out.position;
-    const pb = i * 4;
-    pos[pb] = p[0];
-    pos[pb + 1] = p[1];
-    pos[pb + 2] = p[2];
-    pos[pb + 3] = p[3];
-
-    const vb = i * plan.stride;
-    for (let s = 0; s < plan.vecCount; s++) {
-      const arr = out[plan.vecKeys[s]];
-      const o = vb + plan.vecOff[s];
-      const dim = plan.vecDim[s];
-      if (arr === undefined) {
-        for (let j = 0; j < dim; j++) vf[o + j] = NaN;
-      } else {
-        for (let j = 0; j < dim; j++) vf[o + j] = arr[j];
-      }
-    }
-    for (let s = 0; s < plan.sclCount; s++) {
-      const v = out[plan.sclKeys[s]];
-      vf[vb + plan.sclOff[s]] = typeof v === 'number' ? v : NaN;
-    }
-  }
-
-  /** Runs the vertex shader over `count` vertices, then submits triangles. */
   _runDraw(count, idx, start, base) {
     if (count <= 0) return;
     const vs = this.vs;
@@ -259,222 +371,471 @@ export class DeviceContext {
     // the first vertex also discovers the varying shape for this draw
     const i0 = idx ? base + idx[start] : start;
     const first = vs.fn(this._fetchVertex(i0), cb);
-    const plan = this._buildVaryingPlan(first);
+    const plan = core.buildVaryingPlan(first);
+    const perVert = 4 + plan.stride;
 
-    const pos = new Float64Array(count * 4);
-    const vf = new Float64Array(count * plan.stride);
+    // clip position and varyings live in one interleaved row, so a triangle is a
+    // single contiguous run of doubles
+    const vt = new Float64Array(count * perVert);
 
-    this._writeVertex(pos, vf, 0, first, plan);
+    core.writeVertex(vt, perVert, 0, first, plan);
     for (let i = 1; i < count; i++) {
       const vIdx = idx ? base + idx[start + i] : start + i;
-      this._writeVertex(pos, vf, i, vs.fn(this._fetchVertex(vIdx), cb), plan);
+      core.writeVertex(vt, perVert, i, vs.fn(this._fetchVertex(vIdx), cb), plan);
     }
 
-    for (let i = 0; i + 2 < count; i += 3) {
-      const o0 = i * 4, o1 = (i + 1) * 4, o2 = (i + 2) * 4;
-      const b0 = i * plan.stride, b1 = (i + 1) * plan.stride, b2 = (i + 2) * plan.stride;
-      this._rasterTriangle(pos, o0, o1, o2, vf, b0, b1, b2, plan);
-    }
-  }
-
-  _rasterTriangle(pos, o0, o1, o2, vf, b0, b1, b2, plan) {
-    // near-plane clip in clip space (w > NEAR)
-    const in0 = pos[o0 + 3] > NEAR_W;
-    const in1 = pos[o1 + 3] > NEAR_W;
-    const in2 = pos[o2 + 3] > NEAR_W;
-    if (in0 && in1 && in2) {
-      this._rasterProjected(pos, o0, o1, o2, vf, b0, b1, b2, plan);
+    if (this._willQueue()) {
+      this._queueDraw(vt, count, plan, perVert);
       return;
     }
-    if (!in0 && !in1 && !in2) return;
 
-    // Sutherland-Hodgman against w = NEAR, walking edges (2->0), (0->1), (1->2)
-    const stride = plan.stride;
-    const pp = new Float64Array(16);
-    const pv = new Float64Array(stride * 4);
-    const O = [o2, o0, o1];
-    const B = [b2, b0, b1];
-    const IN = [in2, in0, in1];
-    let n = 0;
-
-    for (let e = 0; e < 3; e++) {
-      const pvIdx = (e + 2) % 3;
-      const curIn = IN[e], prevIn = IN[pvIdx];
-      const curO = O[e], prevO = O[pvIdx];
-      const curB = B[e], prevB = B[pvIdx];
-
-      if (curIn) {
-        if (!prevIn) {
-          const t = (NEAR_W - pos[prevO + 3]) / (pos[curO + 3] - pos[prevO + 3]);
-          this._emitClipped(pp, pv, n, pos, prevO, curO, vf, prevB, curB, t, stride);
-          n++;
-        }
-        this._copyClipped(pp, pv, n, pos, curO, vf, curB, stride);
-        n++;
-      } else if (prevIn) {
-        const t = (NEAR_W - pos[prevO + 3]) / (pos[curO + 3] - pos[prevO + 3]);
-        this._emitClipped(pp, pv, n, pos, prevO, curO, vf, prevB, curB, t, stride);
-        n++;
-      }
-    }
-
-    for (let i = 1; i + 1 < n; i++) {
-      this._rasterProjected(
-        pp, 0, i * 4, (i + 1) * 4,
-        pv, 0, i * stride, (i + 1) * stride,
+    const ctx = this._inlineCtx();
+    for (let i = 0; i + 2 < count; i += 3) {
+      const a0 = i * perVert;
+      core.rasterTriangle(
+        ctx, vt, a0, a0 + perVert, a0 + 2 * perVert,
+        vt, a0 + 4, a0 + perVert + 4, a0 + 2 * perVert + 4,
         plan,
       );
     }
   }
 
-  /** Copy a clipped-polygon vertex (clip space + varying row) at slot `n`. */
-  _copyClipped(pp, pv, n, pos, o, vf, b, stride) {
-    const po = n * 4;
-    pp[po] = pos[o]; pp[po + 1] = pos[o + 1];
-    pp[po + 2] = pos[o + 2]; pp[po + 3] = pos[o + 3];
-    const vo = n * stride;
-    for (let j = 0; j < stride; j++) pv[vo + j] = vf[b + j];
+  /** Snapshot the bound pipeline state into a frame command. */
+  _queueDraw(vt, count, plan, perVert) {
+    const ps = this.ps;
+    if (!ps) throw new Error('Draw: no pixel shader bound.');
+    if (!ps.url) {
+      // a worker cannot receive a function; it has to import the shader module
+      this._fallBackToInline('pixel shader has no source url (use loadShader/createShaderPair)');
+      // replay what was already queued, then draw this one inline
+      const queued = this._commands;
+      this._commands = [];
+      this._replayInline(queued);
+      const ctx = this._inlineCtx();
+      for (let i = 0; i + 2 < count; i += 3) {
+        const a0 = i * perVert;
+        core.rasterTriangle(
+          ctx, vt, a0, a0 + perVert, a0 + 2 * perVert,
+          vt, a0 + 4, a0 + perVert + 4, a0 + 2 * perVert + 4,
+          plan,
+        );
+      }
+      return;
+    }
+
+    const textures = [];
+    const samplers = ps.samplers || {};
+    for (const k in samplers) {
+      const tex = samplers[k];
+      if (!tex) continue;
+      const id = this._textureId(tex);
+      if (id) textures.push({ slot: +k.slice(1), id });
+    }
+
+    this._commands.push({
+      type: 'draw',
+      vt, count, plan,
+      perVert,
+      perTri: 3 * perVert,
+      shaderUrl: ps.url,
+      uniforms: { ...(ps.cbuffer || {}) },
+      textures,
+      // snapshots for the inline path: a queued draw may be replayed after the
+      // app has already bound a different shader
+      psFn: ps.fn,
+      psS: { ...samplers },
+      blend: this.blendState.enabled,
+      depth: { ...this.depthState },
+      cull: this.rsState.cullMode,
+    });
   }
 
-  /** Interpolate an edge crossing into clip space + varying at slot `n`. */
-  _emitClipped(pp, pv, n, pos, oa, ob, vf, ba, bb, t, stride) {
-    const po = n * 4;
-    pp[po] = pos[oa] + (pos[ob] - pos[oa]) * t;
-    pp[po + 1] = pos[oa + 1] + (pos[ob + 1] - pos[oa + 1]) * t;
-    pp[po + 2] = pos[oa + 2] + (pos[ob + 2] - pos[oa + 2]) * t;
-    pp[po + 3] = pos[oa + 3] + (pos[ob + 3] - pos[oa + 3]) * t;
-    const vo = n * stride;
-    for (let j = 0; j < stride; j++) {
-      pv[vo + j] = vf[ba + j] + (vf[bb + j] - vf[ba + j]) * t;
+  _inlineCtx() {
+    return {
+      W: this.fb.width,
+      H: this.fb.height,
+      color: this.fb.color,
+      depth: this.fb.depth,
+      y0: 0,
+      y1: this.fb.height - 1,
+      cullMode: this.rsState.cullMode,
+      depthOn: this.depthState.depthEnable,
+      depthWrite: this.depthState.depthWriteEnable,
+      depthFunc: this.depthState.depthFunc,
+      blended: this.blendState.enabled,
+      psFn: this.ps.fn,
+      psU: this.ps.cbuffer || {},
+      psS: this.ps.samplers || {},
+      stats: this.stats,
+    };
+  }
+
+  /** Build a ctx that draws into an arbitrary color/depth pair (used for replay). */
+  _ctxFor(cmd, color, depth, y0, y1) {
+    return {
+      W: this.fb.width,
+      H: this.fb.height,
+      color, depth, y0, y1,
+      cullMode: cmd.cull,
+      depthOn: cmd.depth.depthEnable,
+      depthWrite: cmd.depth.depthWriteEnable,
+      depthFunc: cmd.depth.depthFunc,
+      blended: cmd.blend,
+      psFn: cmd.psFn,
+      psU: cmd.uniforms,
+      psS: cmd.psS,
+      stats: this.stats,
+    };
+  }
+
+  /** Rasterize queued commands straight to the framebuffer (fallback path). */
+  _replayInline(commands) {
+    const W = this.fb.width, H = this.fb.height;
+    for (const cmd of commands) {
+      if (cmd.type === 'clearColor') {
+        core.clearColorBuffer(this.fb.color, cmd.rgba, W, H, 0);
+      } else if (cmd.type === 'clearDepth') {
+        this.fb.depth.fill(cmd.depth);
+      } else if (cmd.type === 'draw') {
+        const ctx = this._ctxFor(cmd, this.fb.color, this.fb.depth, 0, H - 1);
+        const perVert = cmd.perVert;
+        for (let i = 0; i + 2 < cmd.count; i += 3) {
+          const a0 = i * perVert;
+          core.rasterTriangle(
+            ctx, cmd.vt, a0, a0 + perVert, a0 + 2 * perVert,
+            cmd.vt, a0 + 4, a0 + perVert + 4, a0 + 2 * perVert + 4,
+            cmd.plan,
+          );
+        }
+      }
     }
+  }
+
+  _presentInline() {
+    const now = performance.now();
+    this._framePath = 'inline';
+    this._slabsStale = true;         // fb changed since the last slab sync
+    this.fb.imageData.data.set(this.fb.color);
+    this.ctx2d.putImageData(this.fb.imageData, 0, 0);
+    this._finishFrame(now);
+  }
+
+  _finishFrame(now) {
+    const dt = this._lastPresent ? (now - this._lastPresent) : 16.6;
+    this._lastPresent = now;
+    this.stats.frameMs = dt;
+    this.stats.fps = 1000 / dt;
+    const tris = this.stats.triangles;
+    this._lastPxPerTri = tris > 0 ? this.stats.pixels / tris : 0;
+    this.stats.workers = {
+      requested: this._workerCount,
+      active: this.activeWorkers,
+      cores: hardwareCores(),
+      mode: this._framePath,
+    };
+
+    this.lastFrame = { ...this.stats };
+
+    this.stats.drawCalls = 0;
+    this.stats.triangles = 0;
+    this.stats.culled = 0;
+    this.stats.pixels = 0;
+    this._frameUseParallel = null;   // next frame decides again from the new ratio
+  }
+
+  // ---- worker pool ------------------------------------------------------
+
+  _spawnWorkers(n) {
+    const W = this.fb.width, H = this.fb.height;
+    const bandCount = Math.max(1, Math.min(H, n * 2));
+    const bandRows = Math.ceil(H / bandCount);
+
+    this._bands = [];
+    this._bandRows = bandRows;
+    this._readyPromise = null;
+    this._readyResolve = null;
+    for (let b = 0; b < bandCount; b++) {
+      const y0 = b * bandRows;
+      if (y0 >= H) break;
+      const y1 = Math.min(H - 1, y0 + bandRows - 1);
+      this._bands.push({ index: this._bands.length, y0, y1, owner: b % n });
+    }
+
+    this._readyCount = 0;
+    this._workers = [];
+
+    for (let i = 0; i < n; i++) {
+      let worker;
+      try {
+        worker = new Worker(new URL('./RasterWorker.js', import.meta.url), { type: 'module' });
+      } catch (err) {
+        this._fallBackToInline('could not start a worker: ' + err);
+        return;
+      }
+      worker.onmessage = (e) => this._onWorkerMessage(i, e.data);
+      worker.onerror = (e) => this._fallBackToInline('worker error: ' + (e.message || 'unknown'));
+      worker.onmessageerror = () => this._fallBackToInline('worker message could not be deserialized');
+
+      const owned = this._bands.filter((b) => b.owner === i);
+      worker.postMessage({
+        type: 'init',
+        W, H,
+        bands: owned.map((b) => ({ index: b.index, y0: b.y0, y1: b.y1 })),
+      });
+      this._workers.push(worker);
+    }
+  }
+
+  _onWorkerMessage(i, msg) {
+    if (!msg || !msg.type) return;
+
+    if (msg.type === 'ready') {
+      this._readyCount = (this._readyCount || 0) + 1;
+      if (this._readyCount === this._workers.length) {
+        this._poolReady = true;
+        if (this._readyResolve) { const r = this._readyResolve; this._readyResolve = null; r(); }
+      }
+      return;
+    }
+
+    if (msg.type === 'framedone') {
+      const pf = this._pending.get(msg.frameId);
+      if (!pf) return;
+      for (const slab of msg.bands) pf.bands.push(slab);
+      pf.pixels += msg.stats ? msg.stats.pixels : 0;
+      pf.remaining--;
+      if (pf.remaining <= 0) {
+        this._pending.delete(msg.frameId);
+        this._composite(pf);
+      }
+    }
+  }
+
+  _composite(pf) {
+    const W = this.fb.width;
+    for (const slab of pf.bands) {
+      this.fb.color.set(slab.color, slab.y0 * W * 4);
+      this.fb.depth.set(slab.depth, slab.y0 * W);
+    }
+    this.stats.pixels += pf.pixels;
+
+    const now = performance.now();
+    this._framePath = 'parallel';
+    this._slabsStale = false;      // workers own the pixels again
+    this.fb.imageData.data.set(this.fb.color);
+    this.ctx2d.putImageData(this.fb.imageData, 0, 0);
+    this._finishFrame(now);
+    pf.resolve(this.lastFrame);
+  }
+
+  _activateParallel() {
+    this._parallel = true;
+    this._commands.length = 0;
+    this._syncSlabs();
   }
 
   /**
-   * Rasterize one fully-inside triangle. `cp` holds clip-space xyzw, `cv` holds
-   * varying rows; `a0..a2` / `b0..b2` are the row offsets of its three vertices.
+   * Hand each worker its slice of the current framebuffer, so a frame that does
+   * not clear behaves the same as it would inline — and so switching back from
+   * an inline frame does not resurrect stale pixels.
    */
-  _rasterProjected(cp, a0, a1, a2, cv, b0, b1, b2, plan) {
+  _syncSlabs() {
+    const W = this.fb.width;
+    for (let i = 0; i < this._workers.length; i++) {
+      const owned = this._bands.filter((b) => b.owner === i);
+      this._workers[i].postMessage({
+        type: 'sync',
+        slabs: owned.map((b) => ({
+          index: b.index,
+          y0: b.y0,
+          y1: b.y1,
+          color: this.fb.color.subarray(b.y0 * W * 4, (b.y1 + 1) * W * 4),
+          depth: this.fb.depth.subarray(b.y0 * W, (b.y1 + 1) * W),
+        })),
+      });
+    }
+    this._slabsStale = false;
+  }
+
+  _presentParallel() {
+    const frameId = ++this._frameSeq;
+    const draws = [];
+
+    for (const cmd of this._commands) {
+      if (cmd.type !== 'draw') { draws.push(cmd); continue; }
+      const packed = this._compactBands(cmd);
+      draws.push({
+        type: 'draw',
+        shaderUrl: cmd.shaderUrl,
+        uniforms: cmd.uniforms,
+        textures: cmd.textures,
+        blend: cmd.blend,
+        depth: cmd.depth,
+        cull: cmd.cull,
+        planDesc: core.planDescriptor(cmd.plan),
+        perVert: cmd.perVert,
+        perTri: cmd.perTri,
+        perBand: packed.perBand,
+        bandTriCount: packed.counts,
+      });
+    }
+
+    if (draws.length === 0) {
+      // nothing was drawn this frame: just re-present the composited frame
+      this._commands = [];
+      this.fb.imageData.data.set(this.fb.color);
+      this.ctx2d.putImageData(this.fb.imageData, 0, 0);
+      this._finishFrame(performance.now());
+      return Promise.resolve(this.lastFrame);
+    }
+
+    // textures travel with the first frame that uses them
+    const texturePayload = [];
+    for (const [id, tex] of this._texById) {
+      if (this._texSent.has(id)) continue;
+      texturePayload.push({ id, w: tex.width, h: tex.height, data: tex.data });
+    }
+
+    const owned = this._bands;
+    const messages = this._workers.map((_, wi) => ({
+      type: 'frame',
+      frameId,
+      textures: texturePayload,
+      draws: draws.map((d) => {
+        if (d.type !== 'draw') return d;
+        const perBand = {}, bandTriCount = {};
+        for (const b of owned) {
+          if (b.owner !== wi) continue;
+          const arr = d.perBand[b.index];
+          if (!arr) continue;
+          perBand[b.index] = arr;
+          bandTriCount[b.index] = d.bandTriCount[b.index];
+        }
+        return { ...d, perBand, bandTriCount };
+      }),
+    }));
+
+    this._commands = [];
+    for (const p of texturePayload) this._texSent.add(p.id);
+
+    return new Promise((resolve) => {
+      this._pending.set(frameId, { remaining: this._workers.length, bands: [], pixels: 0, resolve });
+      for (let i = 0; i < this._workers.length; i++) this._workers[i].postMessage(messages[i]);
+    });
+  }
+
+  /**
+   * Split one queued draw into per-band triangle payloads.
+   * Each triangle is copied into every band its screen-space bbox touches, and
+   * back-face culling is decided here so the same triangle is counted once.
+   * @returns {Object<number, Float64Array>} band index -> packed triangles
+   */
+  _compactBands(cmd) {
     const W = this.fb.width, H = this.fb.height;
+    const nb = this._bands.length;
+    const perVert = cmd.perVert;
+    const perTri = cmd.perTri;
+    const triCount = Math.max(0, Math.floor(cmd.count / 3));
 
-    // w-divide + viewport transform
-    const cw0 = cp[a0 + 3];
-    const inv0 = 1 / (cw0 || 1e-8);
-    const sx0 = (cp[a0] * inv0 + 1) * 0.5 * W;
-    const sy0 = (1 - cp[a0 + 1] * inv0) * 0.5 * H;
-    const sz0 = cp[a0 + 2] * inv0;
-
-    const cw1 = cp[a1 + 3];
-    const inv1 = 1 / (cw1 || 1e-8);
-    const sx1 = (cp[a1] * inv1 + 1) * 0.5 * W;
-    const sy1 = (1 - cp[a1 + 1] * inv1) * 0.5 * H;
-    const sz1 = cp[a1 + 2] * inv1;
-
-    const cw2 = cp[a2 + 3];
-    const inv2 = 1 / (cw2 || 1e-8);
-    const sx2 = (cp[a2] * inv2 + 1) * 0.5 * W;
-    const sy2 = (1 - cp[a2 + 1] * inv2) * 0.5 * H;
-    const sz2 = cp[a2 + 2] * inv2;
-
-    // 2D signed area (y-down). DX11 default: CW = front.
-    const area = (sx1 - sx0) * (sy2 - sy0) - (sy1 - sy0) * (sx2 - sx0);
-
-    if (this.rsState.cullMode !== 'NONE') {
-      const isBack = area < 0;
-      if ((this.rsState.cullMode === 'BACK' && isBack) ||
-          (this.rsState.cullMode === 'FRONT' && !isBack)) {
-        this.stats.culled++;
-        return;
-      }
+    if (!this._spans || this._spans.length < triCount * 2) {
+      this._spans = new Int32Array(Math.max(4096, triCount * 2));
     }
-    if (Math.abs(area) < 1e-12) return;
-    this.stats.triangles++;
+    if (!this._counts || this._counts.length < nb) this._counts = new Int32Array(nb);
 
-    const minX = Math.max(0, Math.floor(Math.min(sx0, sx1, sx2)));
-    const maxX = Math.min(W - 1, Math.ceil(Math.max(sx0, sx1, sx2)));
-    const minY = Math.max(0, Math.floor(Math.min(sy0, sy1, sy2)));
-    const maxY = Math.min(H - 1, Math.ceil(Math.max(sy0, sy1, sy2)));
+    const spans = this._spans, counts = this._counts;
+    if (!this._bounds) this._bounds = new Float64Array(5);
+    const bd = this._bounds;
+    counts.fill(0, 0, nb);
 
-    // ---- hoist state and varying plan out of the pixel loop ----
-    const depthOn = this.depthState.depthEnable;
-    const depthWrite = this.depthState.depthWriteEnable;
-    const depthFunc = this.depthState.depthFunc;
-    const depth = this.fb.depth;
-    const color = this.fb.color;
-    const psFn = this.ps.fn;
-    const psU = this.ps.cbuffer || {};
-    const psS = this.ps.samplers || {};
-    const blended = this.blendState.enabled;
+    // pass 1: bounds, cull, per-band counts
+    let t = 0;
+    for (let i = 0; i + 2 < cmd.count; i += 3, t++) {
+      const a0 = i * perVert;
+      if (!core.triBounds(cmd.vt, a0, a0 + perVert, a0 + 2 * perVert, W, H, bd)) {
+        spans[2 * t] = 1;          // b0 > b1 marks "skipped"
+        spans[2 * t + 1] = 0;
+        continue;
+      }
 
-    const nVec = plan.vecCount;
-    const vOff = plan.vecOff;
-    const vDim = plan.vecDim;
-    const vTgt = plan.vecTargets;
-    const nScl = plan.sclCount;
-    const sOff = plan.sclOff;
-    const sKeys = plan.sclKeys;
-    const varyOut = plan.varyOut;
-
-    for (let y = minY; y <= maxY; y++) {
-      const py = y + 0.5;
-      for (let x = minX; x <= maxX; x++) {
-        const px = x + 0.5;
-
-        const w0 = ((sx1 - px) * (sy2 - py) - (sy1 - py) * (sx2 - px)) / area;
-        const w1 = ((sx2 - px) * (sy0 - py) - (sy2 - py) * (sx0 - px)) / area;
-        const w2 = 1 - w0 - w1;
-        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
-
-        const di = y * W + x;
-        const z = w0 * sz0 + w1 * sz1 + w2 * sz2;
-
-        if (depthOn) {
-          if (depthFunc === 'LESS_EQUAL' && z > depth[di]) continue;
-          else if (depthFunc === 'LESS' && z >= depth[di]) continue;
-          else if (depthFunc === 'GREATER' && z < depth[di]) continue;
-        }
-
-        const invW = w0 * inv0 + w1 * inv1 + w2 * inv2;
-        const inv = 1 / invW;
-
-        for (let s = 0; s < nVec; s++) {
-          const off = vOff[s];
-          const dim = vDim[s];
-          const t = vTgt[s];
-          const i0 = b0 + off, i1 = b1 + off, i2 = b2 + off;
-          for (let j = 0; j < dim; j++) {
-            t[j] = (w0 * cv[i0 + j] * inv0 +
-                    w1 * cv[i1 + j] * inv1 +
-                    w2 * cv[i2 + j] * inv2) * inv;
-          }
-        }
-        for (let s = 0; s < nScl; s++) {
-          const o = sOff[s];
-          varyOut[sKeys[s]] = (w0 * cv[b0 + o] * inv0 +
-                               w1 * cv[b1 + o] * inv1 +
-                               w2 * cv[b2 + o] * inv2) * inv;
-        }
-
-        const out = psFn(varyOut, psU, psS);
-        if (!out || out.length < 3) continue;
-        const r = out[0], g = out[1], bch = out[2], a = out.length > 3 ? out[3] : 1;
-
-        if (depthOn && depthWrite) depth[di] = z;
-        this.stats.pixels++;
-
-        const o = di * 4;
-        if (blended) {
-          color[o]   = r * 255 * a + color[o]   * (1 - a);
-          color[o+1] = g * 255 * a + color[o+1] * (1 - a);
-          color[o+2] = bch*255 * a + color[o+2] * (1 - a);
-          color[o+3] = 255;
-        } else {
-          color[o]   = r * 255;
-          color[o+1] = g * 255;
-          color[o+2] = bch * 255;
-          color[o+3] = 255;
+      if (cmd.cull !== 'NONE') {
+        const isBack = bd[0] < 0;
+        if ((cmd.cull === 'BACK' && isBack) || (cmd.cull === 'FRONT' && !isBack)) {
+          this.stats.culled++;
+          spans[2 * t] = 1;
+          spans[2 * t + 1] = 0;
+          continue;
         }
       }
+      this.stats.triangles++;
+
+      const b0 = this._bandIndex(bd[3], nb);
+      const b1 = this._bandIndex(bd[4], nb);
+      spans[2 * t] = b0;
+      spans[2 * t + 1] = b1;
+      for (let b = b0; b <= b1; b++) counts[b]++;
     }
+
+    // pass 2: pack
+    const perBand = {};
+    for (let b = 0; b < nb; b++) if (counts[b] > 0) perBand[b] = new Float64Array(counts[b] * perTri);
+    const cursor = new Int32Array(nb);
+
+    t = 0;
+    for (let i = 0; i + 2 < cmd.count; i += 3, t++) {
+      const b0 = spans[2 * t], b1 = spans[2 * t + 1];
+      if (b1 < b0) continue;
+      const src = i * perVert;                     // 3 consecutive interleaved rows
+      for (let b = b0; b <= b1; b++) {
+        const dst = perBand[b];
+        let d = cursor[b] * perTri;
+        for (let j = 0; j < perTri; j++) dst[d++] = cmd.vt[src + j];
+        cursor[b]++;
+      }
+    }
+
+    this._lastBandCounts = counts;
+    return { perBand, counts: counts.slice(0, nb) };
+  }
+
+  _bandIndex(y, nb) {
+    const b = Math.floor(y / this._bandRows);
+    return b < 0 ? 0 : (b >= nb ? nb - 1 : b);
+  }
+
+  _textureId(tex) {
+    let id = this._texIds.get(tex);
+    if (!id) {
+      id = this._nextTexId++;
+      this._texIds.set(tex, id);
+      this._texById.set(id, tex);
+    }
+    return id;
+  }
+
+  _fallBackToInline(why) {
+    this._disabled = true;
+    this._parallel = false;
+    this._poolReady = false;
+    this._frameUseParallel = null;
+    this._shutdownWorkers();
+    if (!this._warned) {
+      this._warned = true;
+      console.warn('[WebCpuGL] parallel rasterization disabled: ' + why);
+    }
+  }
+
+  _shutdownWorkers() {
+    for (const w of this._workers) {
+      try { w.postMessage({ type: 'dispose' }); } catch { /* already gone */ }
+      try { w.terminate(); } catch { /* already gone */ }
+    }
+    this._workers = [];
+    this._bands = [];
+    this._poolReady = false;
+    this._parallel = false;
+    this._frameUseParallel = null;
+    for (const [, pf] of this._pending) pf.resolve(this.lastFrame);
+    this._pending.clear();
   }
 }
 

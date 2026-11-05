@@ -65,7 +65,7 @@ context.RSSetState({ cullMode: 'NONE' });
 context.OMSetDepthStencilState({ depthEnable: true, depthWriteEnable: true });
 context.OMSetBlendState({ enabled: true });
 
-function frame(tMs) {
+async function frame(tMs) {
   const t = tMs / 1000;
   const mvp = math.multiply(math.rotationY(t * 0.6), math.rotationX(Math.sin(t * 0.7) * 0.3));
 
@@ -73,7 +73,7 @@ function frame(tMs) {
   context.ClearRenderTarget([0, 0, 0, 1]);
   context.ClearDepthStencil(1.0);
   context.DrawIndexed(12, 0, 0);
-  context.present();
+  await context.present();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

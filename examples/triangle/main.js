@@ -31,7 +31,9 @@ context.RSSetState({ cullMode: 'BACK' });
 context.OMSetDepthStencilState({ depthEnable: true, depthWriteEnable: true });
 context.OMSetBlendState({ enabled: false });
 
-function frame(tMs) {
+// present() resolves when the frame is on the canvas; awaiting it paces the loop
+// to the raster throughput instead of queueing frames up.
+async function frame(tMs) {
   const t = tMs / 1000;
   const pulse = 0.75 + 0.25 * Math.sin(t * 2.0);
 
@@ -39,7 +41,7 @@ function frame(tMs) {
   context.ClearRenderTarget([0, 0, 0, 1]);
   context.ClearDepthStencil(1.0);
   context.Draw(3, 0);
-  context.present();
+  await context.present();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

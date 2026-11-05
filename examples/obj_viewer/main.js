@@ -23,7 +23,7 @@ const PARTS = [
 
 const canvas = document.getElementById('view');
 // Framebuffer size: defaults to 1920x1080. Change here if you want bigger.
-const { device, context } = createDevice(canvas, 1280, 720);
+const { device, context } = createDevice(canvas, 1920, 1080);
 window.__gpu = context;
 
 // ---- Camera ----
@@ -81,7 +81,7 @@ let lightAngle = 0;
 const lightSpeed = 0.01;
 const lightHeight = 0.6;
 
-function frame() {
+async function frame() {
   camera.update();
   lightAngle += lightSpeed;
   const lx = Math.sin(lightAngle), lz = Math.cos(lightAngle);
@@ -108,11 +108,14 @@ function frame() {
     context.DrawIndexed(part.indexCount, 0, 0);
   }
 
+  // Awaiting present() is required to read fb.color/fb.depth after the frame:
+  // with raster workers the pixels only land in the framebuffer when it resolves.
+  await context.present();
+
   // applyBloom(context.fb.color, context.fb.width, context.fb.height, {
   //   threshold: 0.75, intensity: 0.6, levels: 3, blurSize: 2,
   // });
 
-  context.present();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

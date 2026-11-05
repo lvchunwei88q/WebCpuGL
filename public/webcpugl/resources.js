@@ -43,9 +43,15 @@ export class Texture {
 }
 
 export class Shader {
-  constructor(kind, fn) {
-    this.kind = kind; // 'vs' | 'ps'
+  /**
+   * @param {'vs'|'ps'} kind
+   * @param {Function} fn
+   * @param {string} [url] source module url; raster workers re-import it
+   */
+  constructor(kind, fn, url) {
+    this.kind = kind;    // 'vs' | 'ps'
     this.fn = fn;
+    this.url = url || null; // set by Device.createShaderPair for worker mode
     this.cbuffer = {};   // bound constant-buffer content
     this.samplers = {};  // for PS: slot -> Texture
   }
