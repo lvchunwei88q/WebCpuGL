@@ -23,7 +23,7 @@ const PARTS = [
 
 const canvas = document.getElementById('view');
 // Framebuffer size: defaults to 1920x1080. Change here if you want bigger.
-const { device, context } = createDevice(canvas, 192, 108);
+const { device, context } = createDevice(canvas, 1280, 720);
 window.__gpu = context;
 
 // ---- Camera ----

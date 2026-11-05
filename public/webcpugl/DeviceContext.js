@@ -1,10 +1,17 @@
 // DX11-style immediate-mode device context. Holds all pipeline state and
 // runs the software rasterizer on the JS main thread.
+//
+// Varyings are carried as flat Float64Array slices (one row per vertex, `stride`
+// doubles wide) instead of per-vertex objects. Per-pixel interpolation therefore
+// reads through numeric offsets and writes into preallocated slot arrays, with no
+// string-keyed lookups and no per-pixel allocation. Fragment shaders still receive
+// an object (`input.vUV`, `input.vNormal`, ...), so .sd files are unchanged.
 
 import { Framebuffer } from './Framebuffer.js';
 import { Buffer, Shader, Texture } from './resources.js';
 
 const FORMAT_SIZE = { FLOAT1: 4, FLOAT2: 8, FLOAT3: 12, FLOAT4: 16 };
+const NEAR_W = 0.001;
 
 export class DeviceContext {
   /**
@@ -126,46 +133,14 @@ export class DeviceContext {
   /** Non-indexed draw. */
   Draw(vertexCount, startVertexLocation = 0) {
     this.stats.drawCalls++;
-    const positions = new Array(vertexCount);
-    const varyings = new Array(vertexCount);
-    for (let i = 0; i < vertexCount; i++) {
-      const v = this._fetchVertex(startVertexLocation + i);
-      const out = this.vs.fn(v, this.vs.cbuffer || {});
-      positions[i] = out.position;
-      const rest = {};
-      for (const k in out) if (k !== 'position') rest[k] = out[k];
-      varyings[i] = rest;
-    }
-    for (let i = 0; i + 2 < vertexCount; i += 3) {
-      this._rasterTriangle(
-        [positions[i], positions[i+1], positions[i+2]],
-        [varyings[i],   varyings[i+1],   varyings[i+2]],
-      );
-    }
+    this._runDraw(vertexCount, null, startVertexLocation, 0);
   }
 
   /** Indexed draw. */
   DrawIndexed(indexCount, startIndexLocation = 0, baseVertexLocation = 0) {
     this.stats.drawCalls++;
     if (!this.indexBuffer) throw new Error('DrawIndexed: no index buffer bound.');
-    const idx = this.indexBuffer.data; // Uint16Array | Uint32Array
-    const positions = new Array(indexCount);
-    const varyings = new Array(indexCount);
-    for (let i = 0; i < indexCount; i++) {
-      const vIdx = baseVertexLocation + idx[startIndexLocation + i];
-      const v = this._fetchVertex(vIdx);
-      const out = this.vs.fn(v, this.vs.cbuffer || {});
-      positions[i] = out.position;
-      const rest = {};
-      for (const k in out) if (k !== 'position') rest[k] = out[k];
-      varyings[i] = rest;
-    }
-    for (let i = 0; i + 2 < indexCount; i += 3) {
-      this._rasterTriangle(
-        [positions[i], positions[i+1], positions[i+2]],
-        [varyings[i],   varyings[i+1],   varyings[i+2]],
-      );
-    }
+    this._runDraw(indexCount, this.indexBuffer.data, startIndexLocation, baseVertexLocation);
   }
 
   /** Push the internal framebuffer to the visible canvas. */
@@ -213,85 +188,199 @@ export class DeviceContext {
     return out;
   }
 
-  _rasterTriangle(pClip, vIn) {
+  /**
+   * Describe the varying shape of a vs() output once per draw call.
+   * Every vector output is stored at a fixed offset inside the flat row,
+   * so interpolation never has to look a key up again.
+   */
+  _buildVaryingPlan(vsOut) {
+    const vecKeys = [], vecDim = [], vecOff = [];
+    const sclKeys = [], sclOff = [];
+    const vecTargets = [];
+    const varyOut = {};              // what fs() receives, reused per triangle
+    let off = 0;
+    for (const k in vsOut) {
+      if (k === 'position') continue;
+      const a = vsOut[k];
+      if (typeof a === 'number') {
+        sclKeys.push(k); sclOff.push(off); off += 1;
+        varyOut[k] = 0;
+      } else {
+        vecKeys.push(k); vecDim.push(a.length); vecOff.push(off); off += a.length;
+        // packed (not holey) so writes stay fast inside the pixel loop
+        const target = new Array(a.length).fill(0);
+        vecTargets.push(target);
+        varyOut[k] = target;
+      }
+    }
+    return {
+      stride: off > 0 ? off : 1,
+      vecCount: vecKeys.length,
+      vecKeys, vecDim, vecOff, vecTargets,
+      sclCount: sclKeys.length,
+      sclKeys, sclOff,
+      varyOut,
+    };
+  }
+
+  /** Copy one vs() output into its position slot and varying row. */
+  _writeVertex(pos, vf, i, out, plan) {
+    const p = out.position;
+    const pb = i * 4;
+    pos[pb] = p[0];
+    pos[pb + 1] = p[1];
+    pos[pb + 2] = p[2];
+    pos[pb + 3] = p[3];
+
+    const vb = i * plan.stride;
+    for (let s = 0; s < plan.vecCount; s++) {
+      const arr = out[plan.vecKeys[s]];
+      const o = vb + plan.vecOff[s];
+      const dim = plan.vecDim[s];
+      if (arr === undefined) {
+        for (let j = 0; j < dim; j++) vf[o + j] = NaN;
+      } else {
+        for (let j = 0; j < dim; j++) vf[o + j] = arr[j];
+      }
+    }
+    for (let s = 0; s < plan.sclCount; s++) {
+      const v = out[plan.sclKeys[s]];
+      vf[vb + plan.sclOff[s]] = typeof v === 'number' ? v : NaN;
+    }
+  }
+
+  /** Runs the vertex shader over `count` vertices, then submits triangles. */
+  _runDraw(count, idx, start, base) {
+    if (count <= 0) return;
+    const vs = this.vs;
+    if (!vs) throw new Error('Draw: no vertex shader bound.');
+    const cb = vs.cbuffer || {};
+
+    // the first vertex also discovers the varying shape for this draw
+    const i0 = idx ? base + idx[start] : start;
+    const first = vs.fn(this._fetchVertex(i0), cb);
+    const plan = this._buildVaryingPlan(first);
+
+    const pos = new Float64Array(count * 4);
+    const vf = new Float64Array(count * plan.stride);
+
+    this._writeVertex(pos, vf, 0, first, plan);
+    for (let i = 1; i < count; i++) {
+      const vIdx = idx ? base + idx[start + i] : start + i;
+      this._writeVertex(pos, vf, i, vs.fn(this._fetchVertex(vIdx), cb), plan);
+    }
+
+    for (let i = 0; i + 2 < count; i += 3) {
+      const o0 = i * 4, o1 = (i + 1) * 4, o2 = (i + 2) * 4;
+      const b0 = i * plan.stride, b1 = (i + 1) * plan.stride, b2 = (i + 2) * plan.stride;
+      this._rasterTriangle(pos, o0, o1, o2, vf, b0, b1, b2, plan);
+    }
+  }
+
+  _rasterTriangle(pos, o0, o1, o2, vf, b0, b1, b2, plan) {
     // near-plane clip in clip space (w > NEAR)
-    const NEAR = 0.001;
-    const inside = [0, 1, 2].map(i => pClip[i][3] > NEAR);
-    if (inside[0] && inside[1] && inside[2]) {
-      this._rasterProjected(pClip, vIn);
+    const in0 = pos[o0 + 3] > NEAR_W;
+    const in1 = pos[o1 + 3] > NEAR_W;
+    const in2 = pos[o2 + 3] > NEAR_W;
+    if (in0 && in1 && in2) {
+      this._rasterProjected(pos, o0, o1, o2, vf, b0, b1, b2, plan);
       return;
     }
-    if (!inside[0] && !inside[1] && !inside[2]) return;
+    if (!in0 && !in1 && !in2) return;
 
-    // Sutherland-Hodgman against w = NEAR
-    const poly = [];
-    const prev = { p: pClip[2], v: vIn[2], in: inside[2] };
-    for (let i = 0; i < 3; i++) {
-      const cur = { p: pClip[i], v: vIn[i], in: inside[i] };
-      if (cur.in) {
-        if (!prev.in) {
-          const t = (NEAR - prev.p[3]) / (cur.p[3] - prev.p[3]);
-          poly.push({ p: this._lerpVec4(prev.p, cur.p, t), v: this._lerpVary(prev.v, cur.v, t) });
+    // Sutherland-Hodgman against w = NEAR, walking edges (2->0), (0->1), (1->2)
+    const stride = plan.stride;
+    const pp = new Float64Array(16);
+    const pv = new Float64Array(stride * 4);
+    const O = [o2, o0, o1];
+    const B = [b2, b0, b1];
+    const IN = [in2, in0, in1];
+    let n = 0;
+
+    for (let e = 0; e < 3; e++) {
+      const pvIdx = (e + 2) % 3;
+      const curIn = IN[e], prevIn = IN[pvIdx];
+      const curO = O[e], prevO = O[pvIdx];
+      const curB = B[e], prevB = B[pvIdx];
+
+      if (curIn) {
+        if (!prevIn) {
+          const t = (NEAR_W - pos[prevO + 3]) / (pos[curO + 3] - pos[prevO + 3]);
+          this._emitClipped(pp, pv, n, pos, prevO, curO, vf, prevB, curB, t, stride);
+          n++;
         }
-        poly.push({ p: cur.p, v: cur.v });
-      } else if (prev.in) {
-        const t = (NEAR - prev.p[3]) / (cur.p[3] - prev.p[3]);
-        poly.push({ p: this._lerpVec4(prev.p, cur.p, t), v: this._lerpVary(prev.v, cur.v, t) });
+        this._copyClipped(pp, pv, n, pos, curO, vf, curB, stride);
+        n++;
+      } else if (prevIn) {
+        const t = (NEAR_W - pos[prevO + 3]) / (pos[curO + 3] - pos[prevO + 3]);
+        this._emitClipped(pp, pv, n, pos, prevO, curO, vf, prevB, curB, t, stride);
+        n++;
       }
-      // swap
-      prev.p = cur.p; prev.v = cur.v; prev.in = cur.in;
     }
-    for (let i = 1; i + 1 < poly.length; i++) {
+
+    for (let i = 1; i + 1 < n; i++) {
       this._rasterProjected(
-        [poly[0].p, poly[i].p, poly[i+1].p],
-        [poly[0].v, poly[i].v, poly[i+1].v],
+        pp, 0, i * 4, (i + 1) * 4,
+        pv, 0, i * stride, (i + 1) * stride,
+        plan,
       );
     }
   }
 
-  _lerpVec4(a, b, t) {
-    return [
-      a[0] + (b[0] - a[0]) * t,
-      a[1] + (b[1] - a[1]) * t,
-      a[2] + (b[2] - a[2]) * t,
-      a[3] + (b[3] - a[3]) * t,
-    ];
+  /** Copy a clipped-polygon vertex (clip space + varying row) at slot `n`. */
+  _copyClipped(pp, pv, n, pos, o, vf, b, stride) {
+    const po = n * 4;
+    pp[po] = pos[o]; pp[po + 1] = pos[o + 1];
+    pp[po + 2] = pos[o + 2]; pp[po + 3] = pos[o + 3];
+    const vo = n * stride;
+    for (let j = 0; j < stride; j++) pv[vo + j] = vf[b + j];
   }
 
-  _lerpVary(a, b, t) {
-    const out = {};
-    for (const k in a) {
-      const av = a[k], bv = b[k];
-      if (typeof av === 'number') out[k] = av + (bv - av) * t;
-      else out[k] = av.map((x, i) => x + (bv[i] - x) * t);
+  /** Interpolate an edge crossing into clip space + varying at slot `n`. */
+  _emitClipped(pp, pv, n, pos, oa, ob, vf, ba, bb, t, stride) {
+    const po = n * 4;
+    pp[po] = pos[oa] + (pos[ob] - pos[oa]) * t;
+    pp[po + 1] = pos[oa + 1] + (pos[ob + 1] - pos[oa + 1]) * t;
+    pp[po + 2] = pos[oa + 2] + (pos[ob + 2] - pos[oa + 2]) * t;
+    pp[po + 3] = pos[oa + 3] + (pos[ob + 3] - pos[oa + 3]) * t;
+    const vo = n * stride;
+    for (let j = 0; j < stride; j++) {
+      pv[vo + j] = vf[ba + j] + (vf[bb + j] - vf[ba + j]) * t;
     }
-    return out;
   }
 
-  _rasterProjected(pClip, vIn) {
+  /**
+   * Rasterize one fully-inside triangle. `cp` holds clip-space xyzw, `cv` holds
+   * varying rows; `a0..a2` / `b0..b2` are the row offsets of its three vertices.
+   */
+  _rasterProjected(cp, a0, a1, a2, cv, b0, b1, b2, plan) {
     const W = this.fb.width, H = this.fb.height;
 
-    // w-divide + viewport transform. p[i] = {sx, sy, sz, invW}
-    const p = new Array(3);
-    for (let i = 0; i < 3; i++) {
-      const x = pClip[i][0], y = pClip[i][1], z = pClip[i][2], w = pClip[i][3];
-      const inv = 1 / (w || 1e-8);
-      p[i] = {
-        sx: ( x * inv + 1) * 0.5 * W,
-        sy: (1 - y * inv) * 0.5 * H,
-        sz: z * inv,
-        invW: inv,
-      };
-    }
+    // w-divide + viewport transform
+    const cw0 = cp[a0 + 3];
+    const inv0 = 1 / (cw0 || 1e-8);
+    const sx0 = (cp[a0] * inv0 + 1) * 0.5 * W;
+    const sy0 = (1 - cp[a0 + 1] * inv0) * 0.5 * H;
+    const sz0 = cp[a0 + 2] * inv0;
+
+    const cw1 = cp[a1 + 3];
+    const inv1 = 1 / (cw1 || 1e-8);
+    const sx1 = (cp[a1] * inv1 + 1) * 0.5 * W;
+    const sy1 = (1 - cp[a1 + 1] * inv1) * 0.5 * H;
+    const sz1 = cp[a1 + 2] * inv1;
+
+    const cw2 = cp[a2 + 3];
+    const inv2 = 1 / (cw2 || 1e-8);
+    const sx2 = (cp[a2] * inv2 + 1) * 0.5 * W;
+    const sy2 = (1 - cp[a2 + 1] * inv2) * 0.5 * H;
+    const sz2 = cp[a2 + 2] * inv2;
 
     // 2D signed area (y-down). DX11 default: CW = front.
-    const area =
-      (p[1].sx - p[0].sx) * (p[2].sy - p[0].sy) -
-      (p[1].sy - p[0].sy) * (p[2].sx - p[0].sx);
+    const area = (sx1 - sx0) * (sy2 - sy0) - (sy1 - sy0) * (sx2 - sx0);
 
     if (this.rsState.cullMode !== 'NONE') {
       const isBack = area < 0;
-      if ((this.rsState.cullMode === 'BACK'  && isBack) ||
+      if ((this.rsState.cullMode === 'BACK' && isBack) ||
           (this.rsState.cullMode === 'FRONT' && !isBack)) {
         this.stats.culled++;
         return;
@@ -300,27 +389,12 @@ export class DeviceContext {
     if (Math.abs(area) < 1e-12) return;
     this.stats.triangles++;
 
-    const minX = Math.max(0, Math.floor(Math.min(p[0].sx, p[1].sx, p[2].sx)));
-    const maxX = Math.min(W - 1, Math.ceil(Math.max(p[0].sx, p[1].sx, p[2].sx)));
-    const minY = Math.max(0, Math.floor(Math.min(p[0].sy, p[1].sy, p[2].sy)));
-    const maxY = Math.min(H - 1, Math.ceil(Math.max(p[0].sy, p[1].sy, p[2].sy)));
+    const minX = Math.max(0, Math.floor(Math.min(sx0, sx1, sx2)));
+    const maxX = Math.min(W - 1, Math.ceil(Math.max(sx0, sx1, sx2)));
+    const minY = Math.max(0, Math.floor(Math.min(sy0, sy1, sy2)));
+    const maxY = Math.min(H - 1, Math.ceil(Math.max(sy0, sy1, sy2)));
 
-    // ---- precompile varying layout once per triangle ----
-    const layout = [];
-    const varyOut = {};
-    const v0 = vIn[0], v1 = vIn[1], v2 = vIn[2];
-    for (const k in v0) {
-      const a = v0[k];
-      if (typeof a === 'number') {
-        layout.push({ key: k, vec: false });
-        varyOut[k] = 0;
-      } else {
-        layout.push({ key: k, vec: true, dim: a.length });
-        varyOut[k] = new Array(a.length);
-      }
-    }
-
-    // ---- hoist depth test branch out of pixel loop ----
+    // ---- hoist state and varying plan out of the pixel loop ----
     const depthOn = this.depthState.depthEnable;
     const depthWrite = this.depthState.depthWriteEnable;
     const depthFunc = this.depthState.depthFunc;
@@ -329,19 +403,29 @@ export class DeviceContext {
     const psFn = this.ps.fn;
     const psU = this.ps.cbuffer || {};
     const psS = this.ps.samplers || {};
+    const blended = this.blendState.enabled;
+
+    const nVec = plan.vecCount;
+    const vOff = plan.vecOff;
+    const vDim = plan.vecDim;
+    const vTgt = plan.vecTargets;
+    const nScl = plan.sclCount;
+    const sOff = plan.sclOff;
+    const sKeys = plan.sclKeys;
+    const varyOut = plan.varyOut;
 
     for (let y = minY; y <= maxY; y++) {
       const py = y + 0.5;
       for (let x = minX; x <= maxX; x++) {
         const px = x + 0.5;
 
-        const w0 = ((p[1].sx - px) * (p[2].sy - py) - (p[1].sy - py) * (p[2].sx - px)) / area;
-        const w1 = ((p[2].sx - px) * (p[0].sy - py) - (p[2].sy - py) * (p[0].sx - px)) / area;
+        const w0 = ((sx1 - px) * (sy2 - py) - (sy1 - py) * (sx2 - px)) / area;
+        const w1 = ((sx2 - px) * (sy0 - py) - (sy2 - py) * (sx0 - px)) / area;
         const w2 = 1 - w0 - w1;
         if (w0 < 0 || w1 < 0 || w2 < 0) continue;
 
         const di = y * W + x;
-        const z = w0 * p[0].sz + w1 * p[1].sz + w2 * p[2].sz;
+        const z = w0 * sz0 + w1 * sz1 + w2 * sz2;
 
         if (depthOn) {
           if (depthFunc === 'LESS_EQUAL' && z > depth[di]) continue;
@@ -349,19 +433,25 @@ export class DeviceContext {
           else if (depthFunc === 'GREATER' && z < depth[di]) continue;
         }
 
-        const invW = w0 * p[0].invW + w1 * p[1].invW + w2 * p[2].invW;
+        const invW = w0 * inv0 + w1 * inv1 + w2 * inv2;
         const inv = 1 / invW;
-        for (let li = 0; li < layout.length; li++) {
-          const L = layout[li];
-          const a = v0[L.key], b = v1[L.key], c = v2[L.key];
-          if (!L.vec) {
-            varyOut[L.key] = (w0*a*p[0].invW + w1*b*p[1].invW + w2*c*p[2].invW) * inv;
-          } else {
-            const out = varyOut[L.key];
-            for (let i = 0; i < L.dim; i++) {
-              out[i] = (w0*a[i]*p[0].invW + w1*b[i]*p[1].invW + w2*c[i]*p[2].invW) * inv;
-            }
+
+        for (let s = 0; s < nVec; s++) {
+          const off = vOff[s];
+          const dim = vDim[s];
+          const t = vTgt[s];
+          const i0 = b0 + off, i1 = b1 + off, i2 = b2 + off;
+          for (let j = 0; j < dim; j++) {
+            t[j] = (w0 * cv[i0 + j] * inv0 +
+                    w1 * cv[i1 + j] * inv1 +
+                    w2 * cv[i2 + j] * inv2) * inv;
           }
+        }
+        for (let s = 0; s < nScl; s++) {
+          const o = sOff[s];
+          varyOut[sKeys[s]] = (w0 * cv[b0 + o] * inv0 +
+                               w1 * cv[b1 + o] * inv1 +
+                               w2 * cv[b2 + o] * inv2) * inv;
         }
 
         const out = psFn(varyOut, psU, psS);
@@ -372,7 +462,7 @@ export class DeviceContext {
         this.stats.pixels++;
 
         const o = di * 4;
-        if (this.blendState.enabled) {
+        if (blended) {
           color[o]   = r * 255 * a + color[o]   * (1 - a);
           color[o+1] = g * 255 * a + color[o+1] * (1 - a);
           color[o+2] = bch*255 * a + color[o+2] * (1 - a);
